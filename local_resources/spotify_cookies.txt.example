@@ -1,0 +1,5 @@
+# Netscape HTTP Cookie File
+# Export an authorized logged-in open.spotify.com web session.
+# The .spotify.com sp_dc value below must be replaced with the real cookie.
+# Keep the seven fields separated by single tabs. Never publish the real file.
+.spotify.com	TRUE	/	TRUE	0	sp_dc	REPLACE_WITH_SPOTIFY_WEB_SESSION_COOKIE

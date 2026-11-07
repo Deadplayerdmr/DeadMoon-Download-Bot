@@ -1,0 +1,13 @@
+DEADMOON EXAMPLE -- NOT A PROVISIONED WIDEVINE DEVICE
+
+Replace this placeholder with a real, provisioned Widevine device binary named:
+  local_resources/device.wvd
+
+Set in token.env:
+  SPOTIFY_WVD_PATH=/usr/src/app/local_resources/device.wvd
+  AMAZON_WVD_PATH=/usr/src/app/local_resources/device.wvd
+
+The real .wvd file is binary and device-specific. Generate or export it with the
+provisioning tooling for your authorized Amazon Music downloader. Do not rename
+this text placeholder to device.wvd: it cannot authenticate or decrypt media.
+Do not commit or distribute the real device.wvd file.

@@ -1,0 +1,25 @@
+services:
+  worker:
+    container_name: DeadMoon_Downloader
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - ENABLE_FLAC=${ENABLE_FLAC:-1}
+    volumes:
+      - type: bind
+        source: ./local_resources/
+        target: /usr/src/app/local_resources/
+        read_only: true
+      # Host directory for finished archives when COPY_FILES_PATH=/files
+      - ./downloads:/files
+      # Persist whitelist.json outside the container
+      - ./data:/usr/src/app/data
+      # The /arl and /newarl commands read and rewrite this file directly, so it
+      # has to exist in the container.
+      - ./token.env:/usr/src/app/token.env
+    restart: always
+    env_file:
+      - token.env
+    environment:
+      - COOKIES_PATH=/usr/src/app/local_resources/cookies.txt

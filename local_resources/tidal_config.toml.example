@@ -1,0 +1,19 @@
+# Streamrip Tidal settings example. Do not put real credentials in this file.
+# DeadMoon generates a private per-download config from token.env. If you obtain
+# these values through streamrip's authorized OAuth device login, copy only the
+# values into the variables below. The bot does not read tidal_config.toml directly.
+#
+# token.env              streamrip [tidal] field
+# TIDAL_USER_ID          user_id
+# TIDAL_ACCESS_TOKEN     access_token
+# TIDAL_REFRESH_TOKEN    refresh_token
+# TIDAL_TOKEN_EXPIRY     token_expiry (Unix timestamp)
+# TIDAL_COUNTRY_CODE     country_code
+# TIDAL_OAUTH_TOKEN may instead contain a JSON object with the four OAuth fields.
+
+[tidal]
+user_id = "REPLACE_WITH_TIDAL_USER_ID"
+access_token = "REPLACE_WITH_TIDAL_ACCESS_TOKEN"
+refresh_token = "REPLACE_WITH_TIDAL_REFRESH_TOKEN"
+token_expiry = "REPLACE_WITH_UNIX_EXPIRY_TIMESTAMP"
+country_code = "US"

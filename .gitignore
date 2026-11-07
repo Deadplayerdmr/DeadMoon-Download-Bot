@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+bin/
+lib/
+include/
+pyvenv.cfg
+.python-version
+
+# IDE
+.idea/
+.ropeproject/
+.vscode/
+
+# OS
+.DS_Store
+
+# Ruff
+.ruff_cache/
+
+# Runtime
+tmp/
+temp_download/
+local_resources/*
+!local_resources/.gitkeep
+!local_resources/README.md
+!local_resources/*.example
+
+# Secrets
+token.env
+
+# Packaged release archives (generated, not source)
+*.zip
+
+# Runtime state (mounted volume in docker-compose; holds user chat IDs)
+data/

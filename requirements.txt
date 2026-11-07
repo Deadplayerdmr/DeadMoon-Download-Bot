@@ -1,0 +1,57 @@
+aiogram==3.28.2
+requests==2.34.2
+mutagen==1.47.0
+Pillow==13.0.0
+yt-dlp==2026.10.26
+aioshutil==1.6
+Unidecode==1.4.0
+aiohttp==3.13.5
+pycryptodome==3.23.0
+certifi==2026.5.20
+tomlkit>=0.13.2
+httpx>=0.27.0
+
+# ---------------------------------------------------------------------------
+# Direct-engine runtime dependencies. Engine wheels are installed separately
+# with --no-deps by the Dockerfile because their declared caps are mutually
+# exclusive. The tested call sites run with the newer explicit pins below.
+#
+# streamrip wants Pillow<11 and tomlkit<0.8 and pyplayready wants
+# cryptography<46. Their tested call sites run with the newer explicit pins
+# below. dotify-cli and pywidevine use modern protobuf; no legacy Librespot
+# audio dependency or old protobuf override remains.
+# ---------------------------------------------------------------------------
+# streamrip runtime deps (pytest packages are incorrectly declared non-optional):
+rich==13.9.4
+simple-term-menu==1.6.6
+aiodns==3.6.1
+pytest==9.0.2
+pytest-asyncio==0.21.2
+pytest-mock==3.15.1
+aiofiles==25.1.0
+aiolimiter==1.1.0
+appdirs==1.4.4
+click-help-colors==0.9.4
+deezer-py==1.3.6
+pathvalidate==2.5.2
+pycryptodomex==3.23.0
+m3u8==6.0.0
+# gamdl and DRM runtime deps:
+cryptography==45.0.7
+async-lru==2.4.0
+colorama==0.4.6
+dataclass-click==1.0.4
+httpx-retries==0.6.0
+inquirerpy==0.3.4
+pymp4==1.4.0
+pywidevine==1.9.0
+structlog==26.1.0
+# pyplayready runtime deps (also installed --no-deps, as a gamdl dependency):
+construct==2.8.8
+ECPy==1.2.5
+platformdirs==4.4.0
+PyYAML==6.0.3
+# dotify-cli web/Widevine runtime deps. No Librespot session is used.
+protobuf==6.33.6
+pybase62==1.0.0
+unplayplay==0.0.9

@@ -1,0 +1,6 @@
+# Netscape HTTP Cookie File
+# https://curl.se/docs/http-cookies.html
+# Export an authorized Apple Music session as local_resources/apple_cookies.txt.
+# Replace the final field with your media-user-token; keep single-tab separators.
+# token.env: APPLE_COOKIES_PATH=/usr/src/app/local_resources/apple_cookies.txt
+.apple.com	TRUE	/	TRUE	0	media-user-token	REPLACE_WITH_APPLE_MEDIA_USER_TOKEN

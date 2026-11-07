@@ -1,0 +1,20 @@
+# Streamrip Qobuz settings example. Do not put real credentials in this file.
+# DeadMoon generates a private per-download config from token.env. If you obtain
+# these values with streamrip, copy only the values into the variables below.
+# The bot does not read qobuz_config.toml directly.
+#
+# token.env                         streamrip [qobuz] field
+# QOBUZ_USE_AUTH_TOKEN              use_auth_token (1 = token login)
+# QOBUZ_EMAIL_OR_USER_ID            email_or_userid (QOBUZ_USER_ID is also accepted)
+# QOBUZ_PASSWORD_OR_TOKEN           password_or_token (QOBUZ_USER_AUTH_TOKEN is preferred)
+# QOBUZ_APP_ID                      app_id
+# QOBUZ_SECRETS                     secrets (comma-separated in token.env)
+# For email/password login, QOBUZ_EMAIL and QOBUZ_PASSWORD map to the same two
+# login fields. Use only credentials and application values you are authorized to use.
+
+[qobuz]
+use_auth_token = true
+email_or_userid = "REPLACE_WITH_QOBUZ_USER_ID"
+password_or_token = "REPLACE_WITH_QOBUZ_USER_AUTH_TOKEN"
+app_id = "REPLACE_WITH_QOBUZ_APP_ID"
+secrets = ["REPLACE_WITH_QOBUZ_SECRET"]

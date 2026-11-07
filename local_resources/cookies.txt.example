@@ -1,0 +1,10 @@
+# Netscape HTTP Cookie File
+# https://curl.se/docs/http-cookies.html
+#
+# Export authorized YouTube or SoundCloud browser cookies in this format and
+# save the result as local_resources/cookies.txt (without .example).
+# token.env: COOKIES_PATH=/usr/src/app/local_resources/cookies.txt
+# Fields: domain, include-subdomains, path, secure, expiry, name, value.
+# Keep fields separated by single tabs. These values are placeholders.
+.youtube.com	TRUE	/	TRUE	0	YOUTUBE_COOKIE_NAME	REPLACE_WITH_AUTHORIZED_COOKIE_VALUE
+.soundcloud.com	TRUE	/	TRUE	0	SOUNDCLOUD_COOKIE_NAME	REPLACE_WITH_AUTHORIZED_COOKIE_VALUE
