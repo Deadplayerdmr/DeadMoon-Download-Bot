@@ -130,7 +130,16 @@ _TRACK_OUTPUT = re.compile(
 )
 
 
+_PROGRESS_ERROR_MARKERS = (
+    "401", "403", "429", "unauthorized", "forbidden", "too many requests",
+    "error", "exception", "traceback", ".py:", "│", "╭", "╰", "╪", "─",
+)
+
+
 def _progress_from_output(line: str, seen_files: set[Path], cwd: Path) -> str | None:
+    lowered = line.casefold()
+    if any(marker in lowered for marker in _PROGRESS_ERROR_MARKERS):
+        return None
     match = _TRACK_OUTPUT.search(line.strip())
     if match:
         title = match.group(1).strip(" .#")
@@ -771,10 +780,8 @@ def _streamrip_config(platform: str, workdir: Path) -> Path:
     downloads["source_subdirectories"] = False
     downloads["disc_subdirectories"] = False
     downloads["concurrency"] = True
-    downloads["max_connections"] = pcfg.get_int_env("STREAMRIP_MAX_CONNECTIONS", 3)
-    downloads["requests_per_minute"] = pcfg.get_int_env(
-        "STREAMRIP_REQUESTS_PER_MINUTE", 30
-    )
+    downloads["max_connections"] = pcfg.streamrip_max_connections()
+    downloads["requests_per_minute"] = 30
     downloads["verify_ssl"] = True
 
     doc["database"]["downloads_enabled"] = False
@@ -797,7 +804,8 @@ def _streamrip_config(platform: str, workdir: Path) -> Path:
     else:
         raise EngineError(f"streamrip has no engine for {platform!r}")
 
-    with open(config_path, "w", encoding="utf-8") as f:
+    fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(doc.as_string())
     return config_path
 
@@ -807,20 +815,17 @@ def _configure_qobuz(doc, flac: bool) -> None:
     section["quality"] = 3 if flac else 1
     section["download_booklets"] = False
 
-    email = get_env_or_token_file("QOBUZ_EMAIL", "").strip()
-    password = get_env_or_token_file("QOBUZ_PASSWORD", "").strip()
-    userid = (
-        get_env_or_token_file("QOBUZ_USER_ID", "").strip()
-        or get_env_or_token_file("QOBUZ_EMAIL_OR_USER_ID", "").strip()
-    )
-    token = (
-        get_env_or_token_file("QOBUZ_USER_AUTH_TOKEN", "").strip()
-        or get_env_or_token_file("QOBUZ_PASSWORD_OR_TOKEN", "").strip()
-    )
-    app_id = get_env_or_token_file("QOBUZ_APP_ID", "").strip()
-    secrets_raw = get_env_or_token_file("QOBUZ_SECRETS", "").strip()
+    fields = pcfg.qobuz_fields()
+    userid = str(fields.get("email_or_userid") or "")
+    token = str(fields.get("password_or_token") or "")
+    email = userid if "@" in userid else ""
+    password = token
+    app_id = str(fields.get("app_id") or "")
+    secrets = fields.get("secrets") or []
 
-    use_auth_token = get_bool_env("QOBUZ_USE_AUTH_TOKEN", True)
+    use_auth_token = fields.get("use_auth_token", True)
+    if isinstance(use_auth_token, str):
+        use_auth_token = use_auth_token.strip().lower() in ("1", "true", "yes", "on")
 
     if userid and token and use_auth_token:
         section["use_auth_token"] = True
@@ -846,8 +851,8 @@ def _configure_qobuz(doc, flac: bool) -> None:
 
     if app_id:
         section["app_id"] = app_id
-    if secrets_raw:
-        section["secrets"] = [s.strip() for s in secrets_raw.split(",") if s.strip()]
+    if secrets:
+        section["secrets"] = [str(s).strip() for s in secrets if str(s).strip()]
 
 
 def _configure_tidal(doc, flac: bool) -> None:
@@ -861,13 +866,65 @@ def _configure_tidal(doc, flac: bool) -> None:
             "or TIDAL_OAUTH_TOKEN."
         )
     fields = pcfg.tidal_oauth_fields()
-    section["access_token"] = fields["access_token"]
-    section["refresh_token"] = fields["refresh_token"]
-    section["user_id"] = fields.get("user_id", "")
-    section["token_expiry"] = fields.get("token_expiry", "") or str(int(time.time()) + 86400)
-    country = get_env_or_token_file("TIDAL_COUNTRY_CODE", "").strip()
-    if country:
-        section["country_code"] = country
+    section["token_type"] = str(fields.get("token_type") or "Bearer")
+    section["user_id"] = str(fields["user_id"])
+    section["access_token"] = str(fields["access_token"])
+    section["refresh_token"] = str(fields["refresh_token"])
+    section["country_code"] = str(fields.get("country_code") or "US")
+    real_expiry = str(fields.get("token_expiry") or "")
+    claims = pcfg.decode_tidal_jwt_claims(str(fields["access_token"]))
+    try:
+        token_exp = float(claims.get("token_expiry") or real_expiry or 0)
+    except (TypeError, ValueError):
+        token_exp = 0
+    if token_exp > time.time() + 300:
+        section["token_expiry"] = str(int(time.time()) + 86400 * 30)
+    else:
+        section["token_expiry"] = real_expiry
+
+
+def _sync_refreshed_tidal_tokens(config_path: Path, original: dict) -> None:
+    """Persist a token refreshed by Streamrip without failing a good download."""
+    if not config_path.is_file():
+        return
+    try:
+        from tomlkit import parse
+        from dl_utils import credential_migrator as cm
+
+        doc = parse(config_path.read_text(encoding="utf-8"))
+        refreshed = dict(doc.get("tidal", {}))
+        access = str(refreshed.get("access_token") or "")
+        if not access or access == str(original.get("access_token") or ""):
+            return
+        fields = {**original, **refreshed}
+        if pcfg._credential_file_ready("TIDAL_CONFIG_PATH"):
+            path = pcfg._credential_file_path("TIDAL_CONFIG_PATH")
+            cm.write_tidal_credentials(fields, path)
+        else:
+            updates = {
+                "TIDAL_ACCESS_TOKEN": access,
+                "TIDAL_REFRESH_TOKEN": str(refreshed.get("refresh_token") or original.get("refresh_token") or ""),
+                "TIDAL_TOKEN_EXPIRY": str(refreshed.get("token_expiry") or ""),
+            }
+            utils.update_token_env_keys(updates)
+    except Exception as error:
+        print(f"[engine] could not persist refreshed Tidal token: {error}")
+
+
+def _tidal_failure(rc: int, tail: str) -> EngineError:
+    fields = pcfg.tidal_oauth_fields()
+    lowered = tail.casefold()
+    if (
+        str(fields.get("client_id") or "") == "3235"
+        and any(marker in lowered for marker in ("401", "403", "unauthorized", "forbidden"))
+    ):
+        return EngineError(
+            "Tidal token was issued for the Web Player (cid=3235) which Tidal blocks "
+            "from direct stream manifest downloads. Run /authenticatetidal in Telegram "
+            "to link a TV device token via link.tidal.com."
+        )
+    return EngineError(f"streamrip exit {rc}: {tail[-500:]}")
+
 
 
 async def download_via_streamrip(platform: str, url: str, kind: str, workdir: Path, progress_cb=None) -> EngineResult:
@@ -889,10 +946,15 @@ async def download_via_streamrip(platform: str, url: str, kind: str, workdir: Pa
             url,
         ]
 
+    original_tidal_fields = pcfg.tidal_oauth_fields() if platform == pcfg.TIDAL else {}
     rc, tail = await _invoke_subprocess(_run_subprocess, cmd, workdir, progress_cb)
+    if platform == pcfg.TIDAL:
+        _sync_refreshed_tidal_tokens(config_path, original_tidal_fields)
     audio, release_dir, _ = discover_release(workdir)
 
     if rc != 0 and not audio:
+        if platform == pcfg.TIDAL:
+            raise _tidal_failure(rc, tail)
         raise EngineError(f"streamrip exit {rc}: {tail[-500:]}")
     if not audio:
         raise EngineError(f"streamrip produced no audio for {url}")
@@ -984,7 +1046,7 @@ async def download_via_dotify(url: str, kind: str, workdir: Path, progress_cb=No
     if not pcfg.has_spotify_credentials():
         raise EngineError(pcfg.spotify_credentials_error())
 
-    wvd = Path(get_env_or_token_file("SPOTIFY_WVD_PATH", "").strip()).expanduser()
+    wvd = pcfg._credential_file_path("SPOTIFY_WVD_PATH") or Path("")
     try:
         cookies = dotify_shim.stage_cookies(workdir)
     except ValueError as error:
@@ -1106,7 +1168,7 @@ async def _apple_cookies_file(workdir: Path) -> str:
     # A ready-to-go path may be pre-filled even when only the media token is
     # available. Missing/unchanged example files must not mask that fallback.
     if pcfg._credential_file_ready("APPLE_COOKIES_PATH"):
-        return get_env_or_token_file("APPLE_COOKIES_PATH", "").strip()
+        return str(pcfg._credential_file_path("APPLE_COOKIES_PATH"))
 
     token = get_env_or_token_file("APPLE_MEDIA_USER_TOKEN", "").strip()
     if not token:
@@ -1212,7 +1274,8 @@ async def download_via_amazon_cli(url: str, kind: str, workdir: Path, progress_c
     cli = get_env_or_token_file("AMAZON_CLI", "amazon-music-downloader").strip()
     binary = _which(cli)
     token = get_env_or_token_file("AMAZON_DEVICE_TOKEN", "").strip()
-    wvd = get_env_or_token_file("AMAZON_WVD_PATH", "").strip()
+    wvd_path = pcfg._credential_file_path("AMAZON_WVD_PATH")
+    wvd = str(wvd_path) if wvd_path else ""
 
     if not binary:
         raise EngineError(f"AMAZON: CLI {cli!r} not found on PATH")
@@ -1259,7 +1322,10 @@ async def _report(progress_cb, text: str) -> None:
     print(f"[progress] {text}")
     progress_cb = progress_cb or _progress_callback.get()
     if progress_cb:
-        await progress_cb(text)
+        try:
+            await progress_cb(text)
+        except TypeError:
+            await progress_cb(text, force=True)
 
 
 async def _call_with_progress(callback, function, *args, **kwargs):

@@ -1576,5 +1576,65 @@ class TestStreamripConfig(WorkdirCase):
         self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
 
 
+class TestDeadMoonProviderHardening(WorkdirCase):
+    def test_tidal_bearer_valid_expiry_and_throttled_download_config(self):
+        expiry = int(time.time()) + 3600
+        self.set_env(
+            TIDAL_USER_ID="1", TIDAL_ACCESS_TOKEN="valid-token",
+            TIDAL_REFRESH_TOKEN="refresh", TIDAL_TOKEN_EXPIRY=str(expiry),
+        )
+        with mock.patch.object(pe.pcfg, "has_tidal_credentials", return_value=True):
+            doc = {"tidal": {"token_type": ""}}
+            pe._configure_tidal(doc, True)
+        self.assertEqual(doc["tidal"]["token_type"], "Bearer")
+        self.assertEqual(doc["tidal"]["user_id"], "1")
+        self.assertEqual(doc["tidal"]["country_code"], "US")
+        self.assertGreater(int(doc["tidal"]["token_expiry"]), expiry)
+        self.set_env(TIDAL_TOKEN_EXPIRY="1")
+        with mock.patch.object(pe.pcfg, "has_tidal_credentials", return_value=True):
+            pe._configure_tidal(doc, True)
+        self.assertEqual(doc["tidal"]["token_expiry"], "1")
+
+        defaults = {
+            "downloads": {}, "database": {}, "cli": {}, "misc": {}, "artwork": {},
+            "filepaths": {}, "tidal": {},
+        }
+        fake_config = types.SimpleNamespace(set_user_defaults=lambda path: Path(path).write_text(""))
+        class FakeDocument(dict):
+            def as_string(self):
+                return ""
+
+        defaults = FakeDocument(defaults)
+        with mock.patch.dict(sys.modules, {"streamrip": types.ModuleType("streamrip"), "streamrip.config": fake_config}):
+            with mock.patch("tomlkit.parse", return_value=defaults):
+                pe._streamrip_config(pcfg.TIDAL, self.root)
+        self.assertEqual(defaults["downloads"]["requests_per_minute"], 30)
+        self.assertEqual(defaults["downloads"]["max_connections"], 3)
+
+    def test_progress_filters_rich_traceback_and_http_failures(self):
+        cwd = self.root / "downloads"
+        cwd.mkdir()
+        seen = set()
+        for line in (
+            "401 Unauthorized", "HTTP 403 Forbidden", "429 Too Many Requests",
+            "╭───── Traceback ─────╮", "│ value error │", "worker.py: failed",
+        ):
+            self.assertIsNone(pe._progress_from_output(line, seen, cwd))
+
+    def test_refreshed_tidal_token_is_synced_to_private_toml(self):
+        import tomlkit
+        config = self.root / "streamrip_config.toml"
+        resource = self.root / "tidal_config.toml"
+        config.write_text(tomlkit.dumps({"tidal": {"access_token": "new", "refresh_token": "new-refresh", "token_expiry": "42"}}))
+        from dl_utils.credential_migrator import atomic_write_text
+        atomic_write_text(resource, tomlkit.dumps({"tidal": {"access_token": "old", "refresh_token": "old-refresh"}}))
+        os.environ["TIDAL_CONFIG_PATH"] = str(resource)
+        pe._sync_refreshed_tidal_tokens(config, {"access_token": "old", "user_id": "1"})
+        fields = pcfg.tidal_oauth_fields()
+        self.assertEqual(fields["access_token"], "new")
+        self.assertEqual(fields["refresh_token"], "new-refresh")
+        self.assertEqual(resource.stat().st_mode & 0o777, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main()

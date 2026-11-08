@@ -61,6 +61,8 @@ from dl_utils.link_resolver import (
     PLATFORM_QOBUZ,
     PLATFORM_SPOTIFY,
     PLATFORM_TIDAL,
+    PLATFORM_YOUTUBE,
+    PLATFORM_SOUNDCLOUD,
     ResolvedLink,
     extract_url,
     is_shortlink,
@@ -102,6 +104,40 @@ FREE_CATALOGUE_PLATFORMS = frozenset({pcfg.DEEZER})
 # Hosts this router claims
 # ---------------------------------------------------------------------------
 # Canonical hosts plus their mobile wrappers. Deezer, YouTube and SoundCloud are
+
+
+def public_platforms_board(bot_username: str = "DeadMoonBot", supported_labels=None) -> str:
+    """Public help board: feature availability, never engine or credentials."""
+    labels = html.escape(", ".join(supported_labels if supported_labels is not None else supported_platforms()) or "Deezer")
+    board_lines = []
+    artist_labels = []
+    for platform in pcfg.PLATFORMS:
+        enabled = pcfg.platform_enabled(platform)
+        artist = pcfg.artist_download_enabled(platform)
+        label = pcfg.PLATFORM_LABELS[platform]
+        suffix = " · artist ✓" if enabled and artist else ""
+        board_lines.append(
+            f"{'✅' if enabled else '▫️'} <b>{html.escape(label)}</b> — "
+            f"{'enabled' if enabled else 'disabled'}{suffix}"
+        )
+        if artist:
+            artist_labels.append(label)
+    artist_sentence = (
+        "Full artist discography links are enabled for: "
+        + ", ".join(html.escape(label) for label in artist_labels) + "."
+        if artist_labels else
+        "Full artist discography links are currently disabled across all platforms."
+    )
+    return (
+        "🌙 <b>DeadMoon Download Bot</b>\n\n"
+        "<b>Send me a link</b> and I'll send back the audio in its original format (or as a zip archive).\n"
+        f"<b>Supported:</b> {labels}\n\n"
+        + "\n".join(board_lines)
+        + "\n\nTrack and album links work across all supported platforms (including mobile share links).\n"
+        + artist_sentence
+        + "\n\n<i>Inline mode:</i> "
+        + f"<code>@{html.escape(bot_username)} (album|track|artist) &lt;search&gt;</code>"
+    )
 # deliberately absent: those belong to handlers/deezer.py and handlers/yt_dlp.py.
 # Object-id parsing itself lives in link_resolver.classify(), which is the single
 # source of truth shared with the shortlink path — this router never keeps a
@@ -196,6 +232,9 @@ async def _handle_release(event: types.Message, link: ResolvedLink) -> None:
     platform = link.platform
     kind = _effective_kind(link)
     url = _download_url(link)
+    if not pcfg.platform_enabled(platform):
+        await event.answer(pcfg.platform_disabled_message(platform))
+        return
     user_id, username, first_name = get_user_infos(event)
     print(
         f"USER_DEBUG: {platform} {kind} request from user_id={user_id} "
@@ -304,6 +343,9 @@ async def _handle_artist(event: types.Message, link: ResolvedLink) -> None:
 
     # Before a slot is taken: refusing a disabled feature must not push another
     # user's request out of the queue for nothing.
+    if not pcfg.platform_enabled(platform):
+        await _refuse_disabled_platform(event, platform)
+        return
     if not pcfg.artist_download_enabled(platform):
         await event.answer(pcfg.artist_disabled_message(platform))
         return
@@ -511,6 +553,8 @@ for _platform in (
     PLATFORM_AMAZON,
     PLATFORM_SPOTIFY,
     PLATFORM_APPLE,
+    PLATFORM_YOUTUBE,
+    PLATFORM_SOUNDCLOUD,
 ):
     _register_platform_handler(_platform)
 
@@ -570,10 +614,13 @@ async def _refuse_disabled_platform(event: types.Message, platform: str) -> None
 
 
 async def _dispatch(event: types.Message, link: ResolvedLink) -> None:
-    # Ownership check first: Deezer, YouTube and SoundCloud have their own
-    # routers and engines. Without this, any future caller that hands _dispatch
-    # an unrouted link would push it through the streaming engines.
-    if link is None or link.platform not in ROUTED_PLATFORMS:
+    if link is None:
+        return
+    if link.platform in (PLATFORM_YOUTUBE, PLATFORM_SOUNDCLOUD):
+        if link.kind == KIND_ARTIST:
+            await _handle_artist(event, link)
+        return
+    if link.platform not in ROUTED_PLATFORMS:
         return
     if not pcfg.platform_enabled(link.platform):
         await _refuse_disabled_platform(event, link.platform)
@@ -610,8 +657,7 @@ def status_report() -> str:
             f"{flag} <b>{html.escape(state['label'])}</b> — {enabled} · engine "
             f"<code>{html.escape(state['engine'])}</code> · {creds}"
         )
-        if platform == pcfg.DEEZER:
-            line += " · artist ✓" if state["artist_download"] else " · artist ✗"
+        line += " · artist ✓" if state["artist_download"] else " · artist ✗"
         lines.append(line)
 
     snap = scheduler_snapshot()
@@ -634,7 +680,7 @@ def status_report() -> str:
         f"Hosting: {'COPY_FILES_PATH' if pcfg.copy_files_path() else 'direct Telegram upload'}",
         f"Max artist releases: {pcfg.max_artist_releases()}",
     ]
-    return "\n".join(lines)
+    return "🌙 <b>DeadMoon Status Report</b>\n\n" + "\n".join(lines)
 
 
-__all__ = ["status_report", "streaming_router", "supported_platforms"]
+__all__ = ["public_platforms_board", "status_report", "streaming_router", "supported_platforms"]

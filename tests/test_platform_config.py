@@ -94,11 +94,13 @@ class TestDefaults(ConfigIsolationMixin, unittest.TestCase):
         for platform in pcfg.PLATFORMS:
             self.assertTrue(pcfg.platform_enabled(platform), platform)
 
-    def test_only_deezer_allows_artist_downloads(self):
+    def test_artist_downloads_default_off_and_are_opt_in_for_every_platform(self):
         for platform in pcfg.PLATFORMS:
-            self.assertEqual(
-                pcfg.artist_download_enabled(platform), platform == pcfg.DEEZER
-            )
+            with self.subTest(platform=platform, enabled=False):
+                self.assertFalse(pcfg.artist_download_enabled(platform))
+            os.environ[pcfg._env_key(platform, "ARTIST_DOWNLOAD_ENABLED")] = "1"
+            with self.subTest(platform=platform, enabled=True):
+                self.assertTrue(pcfg.artist_download_enabled(platform))
 
     def test_fallback_is_opt_in(self):
         self.assertFalse(pcfg.fallback_enabled())
@@ -127,7 +129,7 @@ class TestDefaults(ConfigIsolationMixin, unittest.TestCase):
                     {"platform", "label", "enabled", "has_credentials", "engine", "artist_download"},
                 )
                 self.assertEqual(state["engine"], engine)
-                self.assertEqual(state["artist_download"], True if platform == pcfg.DEEZER else None)
+                self.assertFalse(state["artist_download"])
 
     def test_disabled_platform_still_reports_its_engine(self):
         os.environ["TIDAL_ENABLED"] = "0"
@@ -176,7 +178,8 @@ class TestDefaults(ConfigIsolationMixin, unittest.TestCase):
         self.assertIn("provisioned Widevine", message)
 
     def test_platform_messages(self):
-        self.assertIn("Deezer", pcfg.artist_disabled_message(pcfg.QOBUZ))
+        self.assertIn("Qobuz", pcfg.artist_disabled_message(pcfg.QOBUZ))
+        self.assertIn("QOBUZ_ARTIST_DOWNLOAD_ENABLED", pcfg.artist_disabled_message(pcfg.QOBUZ))
         self.assertIn("Amazon Music", pcfg.platform_disabled_message(pcfg.AMAZON))
 
 

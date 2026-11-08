@@ -34,24 +34,32 @@ if [ ! -f token.env ]; then
   exit 1
 fi
 
-# Load environment variables from `token.env` file and export them
-set -a
-source token.env
-set +a
+# Migrate multi-field inline credentials before reading configuration or starting Compose.
+if command -v python3 &>/dev/null; then
+  python3 -m dl_utils.credential_migrator
+fi
 
-# Check for ENABLE_FLAC env variable
-if [ "$ENABLE_FLAC" = "1" ]; then
-  echo "FLAC is enabled"
-else
+# Parse only the flag needed by the build; never execute token.env as shell code.
+ENABLE_FLAC_VAL="$(grep -E '^ENABLE_FLAC=' token.env | tail -n 1 | cut -d= -f2- | tr -d "[:space:]\"'")"
+if [ "$ENABLE_FLAC_VAL" = "0" ] || [ "${ENABLE_FLAC_VAL,,}" = "false" ] || [ "${ENABLE_FLAC_VAL,,}" = "no" ] || [ "${ENABLE_FLAC_VAL,,}" = "off" ]; then
   export ENABLE_FLAC="0"
   echo "FLAC is disabled"
+else
+  export ENABLE_FLAC="1"
+  echo "FLAC is enabled"
 fi
 
 # Check if docker compose is available
 if docker compose version &>/dev/null; then
+  if command -v python3 &>/dev/null; then
+    python3 -m dl_utils.ascii_art
+  fi
   docker compose up -d --build
 # Fall back to docker-compose if docker compose is not available
 elif command -v docker-compose &>/dev/null; then
+  if command -v python3 &>/dev/null; then
+    python3 -m dl_utils.ascii_art
+  fi
   docker-compose up -d --build
 else
   echo "Neither docker compose nor docker-compose is available"

@@ -35,6 +35,7 @@ from urllib.parse import quote
 import aiohttp
 import certifi
 
+from dl_utils import platform_config as pcfg
 from dl_utils.link_resolver import (
     KIND_ALBUM,
     KIND_TRACK,
@@ -44,6 +45,8 @@ from dl_utils.link_resolver import (
     PLATFORM_QOBUZ,
     PLATFORM_SPOTIFY,
     PLATFORM_TIDAL,
+    PLATFORM_YOUTUBE,
+    PLATFORM_SOUNDCLOUD,
 )
 
 _ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
@@ -149,12 +152,15 @@ class _Session:
 _SESSION = _Session()
 
 
-async def _fetch_text(url: str, *, params: dict | None = None) -> str | None:
+async def _fetch_text(
+    url: str, *, params: dict | None = None, headers: dict | None = None
+) -> str | None:
     session = await _SESSION.get()
     last_error: Exception | None = None
     for attempt in range(_ATTEMPTS):
         try:
-            async with session.get(url, params=params) as resp:
+            request = session.get(url, params=params, **({"headers": headers} if headers else {}))
+            async with request as resp:
                 if resp.status == 429:
                     retry_after = resp.headers.get("Retry-After")
                     try:
@@ -182,8 +188,10 @@ async def _fetch_text(url: str, *, params: dict | None = None) -> str | None:
     return None
 
 
-async def _fetch_json(url: str, *, params: dict | None = None) -> dict | list | None:
-    text = await _fetch_text(url, params=params)
+async def _fetch_json(
+    url: str, *, params: dict | None = None, headers: dict | None = None
+) -> dict | list | None:
+    text = await _fetch_text(url, params=params, headers=headers)
     if text is None:
         return None
     try:
@@ -764,6 +772,80 @@ async def odesli_links(url: str) -> dict | None:
     }
 
 
+async def tidal_api_metadata(kind: str, object_id: str) -> ReleaseInfo | None:
+    """Resolve Tidal metadata through its authenticated public object API."""
+    if kind not in (KIND_TRACK, KIND_ALBUM):
+        return None
+    from dl_utils import platform_config as pcfg
+
+    if not pcfg.has_tidal_credentials():
+        return None
+    fields = pcfg.tidal_oauth_fields()
+    endpoint = "tracks" if kind == KIND_TRACK else "albums"
+    country = str(fields.get("country_code") or "US")
+    headers = {
+        "Authorization": f"{fields.get('token_type') or 'Bearer'} {fields['access_token']}"
+    }
+    data = await _fetch_json(
+        f"https://api.tidal.com/v1/{endpoint}/{object_id}",
+        params={"countryCode": country},
+        headers=headers,
+    )
+    if not isinstance(data, dict):
+        return None
+    artist_data = data.get("artist") or {}
+    artists = data.get("artists") or []
+    artist = artist_data.get("name") or next(
+        (item.get("name") for item in artists if isinstance(item, dict) and item.get("name")),
+        "Unknown Artist",
+    )
+    album = data.get("album") or {}
+    title = str(data.get("title") or "")
+    date = str(data.get("releaseDate") or data.get("streamStartDate") or "")
+    cover = str(data.get("cover") or album.get("cover") or "").replace("-", "/")
+    info = ReleaseInfo(
+        platform=PLATFORM_TIDAL,
+        kind=kind,
+        object_id=object_id,
+        title=title if kind == KIND_TRACK else "",
+        artist=artist,
+        album_title=title if kind == KIND_ALBUM else str(album.get("title") or ""),
+        year=_year_from(date),
+        release_date=date[:10],
+        cover_url=f"https://resources.tidal.com/images/{cover}/1280x1280.jpg" if cover else "",
+        track_link=f"https://tidal.com/browse/track/{object_id}" if kind == KIND_TRACK else "",
+        album_link=f"https://tidal.com/browse/album/{object_id}" if kind == KIND_ALBUM else "",
+        source="tidal-api",
+    )
+    if kind == KIND_TRACK and data.get("isrc"):
+        info.isrcs = [str(data["isrc"])]
+    if kind == KIND_ALBUM:
+        items = await _fetch_json(
+            f"https://api.tidal.com/v1/albums/{object_id}/tracks",
+            params={"countryCode": country},
+            headers=headers,
+        )
+        rows = items.get("items", []) if isinstance(items, dict) else []
+        for index, item in enumerate(rows, 1):
+            if not isinstance(item, dict):
+                continue
+            track_artists = item.get("artists") or []
+            info.tracks.append(TrackInfo(
+                number=int(item.get("trackNumber") or index),
+                disc=int(item.get("volumeNumber") or 1),
+                title=str(item.get("title") or ""),
+                artist=(item.get("artist") or {}).get("name") or next(
+                    (a.get("name") for a in track_artists if isinstance(a, dict)),
+                    artist,
+                ),
+                isrc=str(item.get("isrc") or ""),
+                duration_ms=int(item.get("duration") or 0) * 1000,
+                explicit=bool(item.get("explicit")),
+                id=str(item.get("id") or ""),
+            ))
+    return info
+
+
 def _meta_content(text: str, key: str) -> str:
     from html import unescape
 
@@ -894,15 +976,20 @@ async def release_info(
             info = await deezer_album(object_id)
     elif platform == PLATFORM_SPOTIFY and url:
         info = await _from_spotify_oembed(url, kind, object_id)
-    elif platform in (PLATFORM_QOBUZ, PLATFORM_AMAZON) and url:
+    elif platform in (PLATFORM_QOBUZ, PLATFORM_TIDAL) and url:
+        info = await _from_odesli(url, kind, object_id, platform)
+        if info is None and platform == PLATFORM_TIDAL:
+            info = await tidal_api_metadata(kind, object_id)
+        if info is None:
+            info = await public_search_metadata(
+                platform, kind, object_id, url, storefront
+            )
+    elif platform == PLATFORM_AMAZON and url:
         info = await public_search_metadata(
             platform, kind, object_id, url, storefront
         )
-    elif platform == PLATFORM_TIDAL and url:
-        info = await _from_odesli(url, kind, object_id, platform)
 
     if info is None and url:
-        # Last resort that still needs no credentials: ask song.link who this is.
         info = await _from_odesli(url, kind, object_id, platform)
 
     if info is None and url and platform in (PLATFORM_QOBUZ, PLATFORM_TIDAL, PLATFORM_AMAZON):
@@ -961,13 +1048,19 @@ async def _from_odesli(url: str, kind: str, object_id: str, platform: str) -> Re
     )
 
 
+def _extract_artist_playlist(source: str, options: dict) -> dict:
+    import yt_dlp
+
+    with yt_dlp.YoutubeDL(options) as downloader:
+        return downloader.extract_info(source, download=False) or {}
+
+
 async def artist_album_links(platform: str, object_id: str, storefront: str | None = None):
     """(artist_name, [release dicts]) for a discography request, or (None, []).
 
-    Apple has a free endpoint that lists an artist's catalogue directly. Every
-    other platform's artist page needs an authenticated API, so the release
-    list comes from that platform's own public web page when available;
-    artist discography downloads remain restricted to Deezer.
+    Apple and Deezer expose catalogue APIs; YouTube Music and SoundCloud use a
+    capped yt-dlp extraction. Other stores use their direct engine when their
+    per-platform artist toggle is enabled.
     """
     if platform == PLATFORM_APPLE:
         data = await itunes_artist(object_id, storefront)
@@ -984,6 +1077,35 @@ async def artist_album_links(platform: str, object_id: str, storefront: str | No
                 "url": f"https://music.apple.com/{country}/album/id{album['id']}",
             }
             for album in data["albums"]
+        ]
+    if platform in (PLATFORM_YOUTUBE, PLATFORM_SOUNDCLOUD):
+        source = (
+            f"https://music.youtube.com/channel/{object_id}"
+            if platform == PLATFORM_YOUTUBE
+            else f"https://soundcloud.com/{object_id}"
+        )
+        options = {
+            "quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
+            "skip_download": True, "playlistend": pcfg.max_artist_releases() + 1,
+        }
+        try:
+            data = await asyncio.to_thread(_extract_artist_playlist, source, options)
+        except Exception as error:
+            print(f"[meta] {platform} artist catalogue lookup failed: {error}")
+            return None, []
+        from urllib.parse import urljoin
+
+        entries = data.get("entries") or []
+        artist = data.get("uploader") or data.get("channel") or data.get("title") or object_id
+        return {"name": artist}, [
+            {
+                "id": str(entry.get("id") or index),
+                "title": entry.get("title") or "Unknown release",
+                "year": "", "release_date": "", "record_type": "album",
+                "url": urljoin(source + "/", entry.get("webpage_url") or entry.get("url")),
+            }
+            for index, entry in enumerate(entries, 1)
+            if entry.get("webpage_url") or entry.get("url")
         ]
     if platform == PLATFORM_DEEZER:
         data = await deezer_artist(object_id)

@@ -23,6 +23,7 @@ from aiogram.types import (
 
 # Import your existing bot setup
 from bot import bot, dp
+from dl_utils import admin_auth
 from dl_utils import platform_config as pcfg
 from dl_utils.deezer_download import TYPE_ALBUM, TYPE_TRACK
 from handlers.deezer import (
@@ -41,6 +42,7 @@ from utils import (
     cancel_download,
     get_env_or_token_file,
     scheduler_snapshot,
+    update_token_env_keys,
 )
 
 # Upstream: Deep-link payload regex for inline download button
@@ -152,6 +154,12 @@ async def set_admin_commands(bot_instance):
         BotCommand(command="blockall", description="Remove ALL whitelisted IDs (except admin)"),
         BotCommand(command="newarl", description="Replace Deezer ARL token: /newarl <arl>"),
         BotCommand(command="arl", description="Show current Deezer ARL token"),
+        BotCommand(command="authenticatedeezer", description="Set Deezer ARL and reload the session"),
+        BotCommand(command="authenticatetidal", description="Link Tidal TV device or paste OAuth credentials"),
+        BotCommand(command="cancelauth", description="Cancel pending Tidal device authorization"),
+        BotCommand(command="authenticateqobuz", description="Save Qobuz login or token credentials"),
+        BotCommand(command="authenticateapple", description="Save Apple Music media-user-token"),
+        BotCommand(command="authenticatesoundcloud", description="Save SoundCloud OAuth token"),
         BotCommand(command="status", description="Enabled platforms, engine modes, queue depth"),
     ]
     
@@ -227,18 +235,11 @@ async def help_start(event: types.Message, command: CommandObject):
                 await handle_album_link(event, real_link=real_link)
             return
 
+    from handlers.streaming import public_platforms_board
+
     bot_info = await bot.get_me()
-    bot_username = html.escape(bot_info.username or "")
-    platforms = html.escape(", ".join(supported_platforms()) or "Deezer")
-    msg = (
-        "Hey, I'm a music acquisition bot.\n\n"
-        "<b>Send me a link</b> and I'll send back the audio as a zip archive.\n"
-        f"<b>Supported:</b> {platforms}\n\n"
-        "Track and album links work across all supported platforms "
-        "(including mobile share links). Full artist discography links "
-        "are supported for Deezer only.\n\n"
-        f"<i>Inline mode:</i> <code>@{bot_username} "
-        "(album|track|artist) &lt;search&gt;</code>"
+    msg = public_platforms_board(
+        bot_info.username or "DeadMoonBot", supported_labels=supported_platforms()
     )
     await event.answer(msg, parse_mode="HTML")
 
@@ -492,55 +493,15 @@ def get_deezer_token() -> str:
 
 
 def set_deezer_token(new_token: str) -> bool:
-    """Update DEEZER_TOKEN in token.env file."""
+    """Update DEEZER_TOKEN through the shared atomic token.env writer."""
+    import utils
+
+    previous = utils.TOKEN_ENV_PATH
+    utils.TOKEN_ENV_PATH = Path(TOKEN_ENV_PATH)
     try:
-        with open(TOKEN_ENV_PATH, "r") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        logging.warning(f"{TOKEN_ENV_PATH} does not exist; creating it")
-        lines = []
-    except OSError as e:
-        logging.error(f"Could not read {TOKEN_ENV_PATH}: {e}")
-        return False
-
-    # Update or add DEEZER_TOKEN
-    found = False
-    for i, line in enumerate(lines):
-        if line.startswith("DEEZER_TOKEN="):
-            lines[i] = f"DEEZER_TOKEN={new_token}\n"
-            found = True
-            break
-
-    if not found:
-        # Add at the beginning after any comments
-        insert_pos = 0
-        for i, line in enumerate(lines):
-            if line.startswith("#"):
-                insert_pos = i + 1
-            elif line.strip():
-                break
-        lines.insert(insert_pos, f"DEEZER_TOKEN={new_token}\n")
-
-    # A last line without a trailing newline would swallow the new key.
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
-
-    try:
-        # os.open applies the mode only when it creates the file, so a
-        # bind-mounted token.env keeps its host permissions while a fresh one
-        # (the FileNotFoundError branch above) lands at 0600 instead of the
-        # umask default of 0644 with the ARL already written into it.
-        fd = os.open(TOKEN_ENV_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.writelines(lines)
-    except OSError as e:
-        logging.error(f"Could not write {TOKEN_ENV_PATH}: {e}")
-        return False
-
-    # Keep this process in sync: init_deezer_session() reads DEEZER_TOKEN from
-    # the environment, so writing the file alone would not change anything.
-    os.environ["DEEZER_TOKEN"] = new_token
-    return True
+        return update_token_env_keys({"DEEZER_TOKEN": new_token})
+    finally:
+        utils.TOKEN_ENV_PATH = previous
 
 
 @dp.message(Command("arl"), F.from_user.id == ADMIN_ID)
@@ -580,7 +541,7 @@ async def update_arl(message: Message):
         return
     
     # Update the token file
-    if set_deezer_token(new_token):
+    if update_token_env_keys({"DEEZER_TOKEN": new_token, "DEEZER_ENABLED": "1"}):
         # Rebuild the session here instead of exiting the process. sys.exit()
         # inside an async handler is unreliable, and a container restart reuses
         # the creation-time environment, so the new token could be lost.
@@ -604,6 +565,225 @@ async def update_arl(message: Message):
         logging.info("Admin updated the ARL token; session reloaded in-process.")
     else:
         await message.reply("❌ Failed to update token.env file")
+
+
+@dp.message(Command("authenticatedeezer"), F.from_user.id == ADMIN_ID)
+async def authenticate_deezer(message: Message):
+    await update_arl(message)
+
+
+_TIDAL_AUTH_TASKS: Dict[int, asyncio.Task] = {}
+
+
+def _blank_tidal_inline_updates() -> dict:
+    return {
+        "TIDAL_USER_ID": "", "TIDAL_ACCESS_TOKEN": "",
+        "TIDAL_REFRESH_TOKEN": "", "TIDAL_TOKEN_EXPIRY": "",
+        "TIDAL_OAUTH_TOKEN": "",
+    }
+
+
+def _save_tidal_authentication(fields: dict) -> bool:
+    from dl_utils import credential_migrator as cm
+
+    required = ("user_id", "access_token", "refresh_token")
+    if any(not str(fields.get(key) or "").strip() for key in required):
+        return False
+    cm.write_tidal_credentials(fields)
+    return update_token_env_keys({
+        "TIDAL_ENABLED": "1",
+        "TIDAL_CONFIG_PATH": cm.TIDAL_CONTAINER_PATH,
+        **_blank_tidal_inline_updates(),
+    })
+
+
+@dp.message(Command("cancelauth"), F.from_user.id == ADMIN_ID)
+async def cancel_auth(message: Message):
+    task = _TIDAL_AUTH_TASKS.pop(ADMIN_ID, None)
+    if task and not task.done():
+        task.cancel()
+        await message.reply("🌙 Pending Tidal authorization cancelled.")
+    else:
+        await message.reply("🌙 There is no pending provider authorization.")
+
+
+async def _complete_tidal_device_auth(device: dict, notice) -> None:
+    try:
+        fields = await admin_auth.poll_tidal_device_token(
+            device["device_code"], device.get("interval", 5), device.get("expires_in", 300)
+        )
+        fields = {
+            **fields,
+            "user_id": fields.get("user_id") or fields.get("user", {}).get("id"),
+            "country_code": fields.get("country_code") or fields.get("countryCode") or "US",
+        }
+        if not _save_tidal_authentication(fields):
+            raise RuntimeError("OAuth response did not contain a complete Tidal credential set.")
+        await notice.edit_text(
+            "🌕 <b>Tidal connected.</b> TV device credentials saved to "
+            "<code>local_resources/tidal_config.toml</code>.",
+            parse_mode="HTML",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logging.error("Tidal device authorization failed: %s", error)
+        await notice.edit_text(
+            f"🌑 <b>Tidal authorization failed.</b>\n<code>{html.escape(str(error))}</code>",
+            parse_mode="HTML",
+        )
+    finally:
+        current = _TIDAL_AUTH_TASKS.get(ADMIN_ID)
+        if current is asyncio.current_task():
+            _TIDAL_AUTH_TASKS.pop(ADMIN_ID, None)
+
+
+@dp.message(Command("authenticatetidal"), F.from_user.id == ADMIN_ID)
+async def authenticate_tidal(message: Message, command: CommandObject):
+    from dl_utils import credential_migrator as cm
+
+    raw = (command.args or "").strip()
+    if raw:
+        fields = cm.parse_tidal_auth_input(raw)
+        if not _save_tidal_authentication(fields):
+            await message.reply(
+                "❌ Supply JSON, key=value fields, or a raw JWT with matching refresh_token. "
+                "Required: user_id, access_token and refresh_token."
+            )
+            return
+        warning = ""
+        if str(fields.get("client_id") or pcfg.decode_tidal_jwt_claims(
+            str(fields.get("access_token") or "")
+        ).get("client_id") or "") == "3235":
+            warning = (
+                "\n⚠️ This is a Web Player token (cid=3235). Tidal may reject direct "
+                "stream downloads; use /authenticatetidal without arguments for TV login."
+            )
+        await message.reply(
+            "🌕 <b>Tidal credentials saved.</b> Config written with owner-only permissions."
+            + warning,
+            parse_mode="HTML",
+        )
+        return
+
+    previous = _TIDAL_AUTH_TASKS.pop(ADMIN_ID, None)
+    if previous and not previous.done():
+        previous.cancel()
+    try:
+        device = await admin_auth.request_tidal_device_code()
+    except Exception as error:
+        await message.reply(f"❌ Could not start Tidal device login: {html.escape(str(error))}")
+        return
+    user_code = str(device["user_code"])
+    verification = str(
+        device.get("verification_uri_complete")
+        or device.get("verificationUriComplete")
+        or f"https://link.tidal.com/{user_code}"
+    )
+    verification = html.escape(verification, quote=True)
+    expires = int(device.get("expires_in") or device.get("expiresIn") or 300)
+    notice = await message.reply(
+        "🌙 <b>Link your Tidal TV device</b>\n\n"
+        f"Open <a href=\"{verification}\">{verification}</a>\n"
+        f"Code: <code>{html.escape(user_code)}</code>\n"
+        f"Expires in {expires // 60} minute(s). Use /cancelauth to stop polling.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    task = asyncio.create_task(_complete_tidal_device_auth(device, notice))
+    _TIDAL_AUTH_TASKS[ADMIN_ID] = task
+    if task.done():
+        _TIDAL_AUTH_TASKS.pop(ADMIN_ID, None)
+
+
+@dp.message(Command("authenticateqobuz"), F.from_user.id == ADMIN_ID)
+async def authenticate_qobuz(message: Message, command: CommandObject):
+    import hashlib
+    from dl_utils import credential_migrator as cm
+
+    args = (command.args or "").split()
+    if len(args) not in (2, 3, 4):
+        await message.reply(
+            "Usage: /authenticateqobuz &lt;email&gt; &lt;password&gt; or "
+            "/authenticateqobuz &lt;user_id&gt; &lt;user_auth_token&gt; [app_id] [secrets]",
+            parse_mode="HTML",
+        )
+        return
+    first, second = args[:2]
+    if len(args) == 2 and "@" in first:
+        fields = {
+            "use_auth_token": False,
+            "email_or_userid": first,
+            "password_or_token": second if re.fullmatch(r"[0-9a-fA-F]{32}", second) else hashlib.md5(second.encode()).hexdigest(),
+            "app_id": "",
+            "secrets": [],
+        }
+    else:
+        fields = {
+            "use_auth_token": True,
+            "email_or_userid": first,
+            "password_or_token": second,
+            "app_id": args[2] if len(args) > 2 else "",
+            "secrets": [s for s in (args[3].split(",") if len(args) > 3 else []) if s],
+        }
+    if not fields["app_id"] or not fields["secrets"]:
+        notice = await message.reply("🌒 Discovering Qobuz application credentials…")
+        try:
+            app_id, secrets = await asyncio.to_thread(
+                admin_auth.discover_qobuz_app_credentials_sync
+            )
+            fields["app_id"] = fields["app_id"] or app_id
+            fields["secrets"] = fields["secrets"] or secrets
+            await notice.delete()
+        except Exception as error:
+            await notice.edit_text(
+                "❌ Qobuz app-id discovery failed. Supply app_id and comma-separated secrets: "
+                f"<code>{html.escape(str(error))}</code>",
+                parse_mode="HTML",
+            )
+            return
+    cm.write_qobuz_credentials(fields)
+    updates = {
+        "QOBUZ_ENABLED": "1", "QOBUZ_CONFIG_PATH": cm.QOBUZ_CONTAINER_PATH,
+        "QOBUZ_USER_AUTH_TOKEN": "", "QOBUZ_EMAIL": "", "QOBUZ_PASSWORD": "",
+        "QOBUZ_APP_ID": "", "QOBUZ_SECRETS": "", "QOBUZ_USER_ID": "",
+    }
+    if not update_token_env_keys(updates):
+        await message.reply("❌ Credentials were written, but token.env could not be updated.")
+        return
+    await message.reply("🌕 <b>Qobuz credentials saved.</b>", parse_mode="HTML")
+
+
+@dp.message(Command("authenticateapple"), F.from_user.id == ADMIN_ID)
+async def authenticate_apple(message: Message, command: CommandObject):
+    from dl_utils import credential_migrator as cm
+
+    token = (command.args or "").strip()
+    if not token:
+        await message.reply("Usage: /authenticateapple <media_user_token>")
+        return
+    cm.write_apple_cookies(token)
+    if not update_token_env_keys({
+        "APPLE_ENABLED": "1", "APPLE_COOKIES_PATH": cm.APPLE_CONTAINER_PATH,
+        "APPLE_MEDIA_USER_TOKEN": "",
+    }):
+        await message.reply("❌ Cookies were written, but token.env could not be updated.")
+        return
+    await message.reply("🌕 <b>Apple Music cookies saved.</b>", parse_mode="HTML")
+
+
+@dp.message(Command("authenticatesoundcloud"), F.from_user.id == ADMIN_ID)
+async def authenticate_soundcloud(message: Message, command: CommandObject):
+    token = (command.args or "").strip()
+    if not token:
+        await message.reply("Usage: /authenticatesoundcloud <oauth_token>")
+        return
+    if not update_token_env_keys({
+        "SOUNDCLOUD_OAUTH_TOKEN": token, "SOUNDCLOUD_ENABLED": "1",
+    }):
+        await message.reply("❌ Failed to update token.env.")
+        return
+    await message.reply("🌕 <b>SoundCloud OAuth token saved.</b>", parse_mode="HTML")
 
 
 # ----------------------------
@@ -776,6 +956,15 @@ async def background_cleanup():
 # MAIN
 # ----------------------------
 async def main() -> None:
+    from dl_utils.ascii_art import run_boot_animation
+    from dl_utils.credential_migrator import migrate_inline_credentials_to_local_resources
+
+    run_boot_animation()
+    try:
+        migrate_inline_credentials_to_local_resources()
+    except Exception as error:
+        logging.error("Credential migration failed: %s", error)
+
     # Include your music routers. streaming_router goes last: its shortlink
     # handler is a catch-all for this router's platforms, and the concrete
     # per-kind handlers inside it are registered before it, so ordering against

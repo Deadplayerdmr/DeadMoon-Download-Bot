@@ -1,11 +1,13 @@
 # Local credential resources
 
-Compose mounts this directory read-only at `/usr/src/app/local_resources` inside the
-container. Put real files here, keep their permissions private, and point `token.env` at the
+Compose mounts this directory **read-write** at `/usr/src/app/local_resources` inside the
+container so `/authenticate*` and Tidal OAuth refresh can persist credentials. Put real files here, keep their permissions private, and point `token.env` at the
 container paths below. The `.example` files contain placeholders, not usable credentials.
 `/status` reports `no creds` for a missing, empty, or unchanged example file.
 
 ```dotenv
+TIDAL_CONFIG_PATH=/usr/src/app/local_resources/tidal_config.toml
+QOBUZ_CONFIG_PATH=/usr/src/app/local_resources/qobuz_config.toml
 SPOTIFY_COOKIES_PATH=/usr/src/app/local_resources/spotify_cookies.txt
 SPOTIFY_WVD_PATH=/usr/src/app/local_resources/device.wvd
 SPOTIFY_CREDENTIALS_PATH=/usr/src/app/local_resources/spotify_credentials.json
@@ -60,8 +62,11 @@ writes the **Netscape HTTP Cookie File** format. Save the export as
 `local_resources/apple_cookies.txt`. It must include the `.apple.com` `media-user-token`
 cookie. `apple_cookies.txt.example` shows the header and seven tab-separated fields.
 
-Alternatively, leave `APPLE_COOKIES_PATH` empty and set `APPLE_MEDIA_USER_TOKEN` directly in
-`token.env`. The bot creates a temporary Netscape file with mode `0600` for Gamdl.
+`/authenticateapple <media_user_token>` writes this file with three Netscape rows
+(`.apple.com`, `music.apple.com`, `.music.apple.com`) and enables Apple Music. An inline
+`APPLE_MEDIA_USER_TOKEN` is migrated here automatically at `update.sh`/startup when no live
+cookie file exists. New files are created with `os.open(..., 0o600)`; existing bind-mounted
+files are not chmod'ed.
 
 ## `cookies.txt` — yt-dlp
 
@@ -85,17 +90,42 @@ share it publicly, or treat an empty/placeholder file as a valid provisioned dev
 repository does not provision Widevine devices. `device.wvd.example` is documentation only;
 renaming it does not create a provisioned device.
 
-## Qobuz and Tidal — streamrip templates
+## Qobuz and Tidal — private Streamrip TOML
 
-`qobuz_config.toml.example` and `tidal_config.toml.example` document streamrip's `[qobuz]`
-and `[tidal]` authentication blocks and their corresponding `token.env` variables. They are
-references, not files loaded by the bot: the engine creates a private per-download config
-from `QOBUZ_*` and `TIDAL_*`. Do not put live tokens in either `.example` file.
+`QOBUZ_CONFIG_PATH` and `TIDAL_CONFIG_PATH` load the live files below. Values in inline
+`QOBUZ_*`/`TIDAL_*` environment keys still override the corresponding TOML fields for
+backward compatibility, but migration blanks inline values after writing the resource.
+Unchanged `.example` files are never accepted as credentials.
 
-For Qobuz, use `QOBUZ_USER_ID` + `QOBUZ_USER_AUTH_TOKEN` for token authentication, or
-`QOBUZ_EMAIL` + `QOBUZ_PASSWORD` for password authentication, with the app ID/secrets your
-authorized setup requires. For Tidal, use `TIDAL_USER_ID`, `TIDAL_ACCESS_TOKEN`,
-`TIDAL_REFRESH_TOKEN`, and optionally `TIDAL_TOKEN_EXPIRY` and `TIDAL_COUNTRY_CODE`.
+```toml
+[qobuz]
+use_auth_token = true
+email_or_userid = "..."
+password_or_token = "..."
+app_id = "..."
+secrets = ["..."]
+```
+
+```toml
+[tidal]
+user_id = "..."
+token_type = "Bearer"
+access_token = "..."
+refresh_token = "..."
+token_expiry = "..."
+country_code = "US"
+```
+
+Use `/authenticateqobuz` for either email/password or user/token authentication. Missing
+Qobuz app ID/secrets are discovered in a worker thread. Use `/authenticatetidal` without
+arguments for interactive TV-device authorization through `link.tidal.com`, or paste OAuth
+JSON/key-value fields. `/cancelauth` stops pending polling. Streamrip token refreshes are
+written back to `tidal_config.toml`.
+
+`python3 -m dl_utils.credential_migrator` also runs automatically in `update.sh` and at bot
+startup. When running outside Docker, an absent `/usr/src/app/local_resources/<name>` path
+falls back to this checkout's `local_resources/<name>`; explicitly configured temporary
+paths are used exactly as supplied. Never put live secrets in `.example` files.
 
 ## Template checklist
 
@@ -106,6 +136,6 @@ Copy a template to the live filename only after replacing every placeholder:
 - `apple_cookies.txt.example` → `apple_cookies.txt`
 - `cookies.txt.example` → `cookies.txt`
 - `device.wvd.example` → replace with a provisioned binary `device.wvd`
-- `qobuz_config.toml.example` and `tidal_config.toml.example` → map values into `token.env`
+- `qobuz_config.toml.example` and `tidal_config.toml.example` → copy and populate, or use `/authenticateqobuz` / `/authenticatetidal`
 
 Every unchanged template is treated as unconfigured, including copies under a live filename.

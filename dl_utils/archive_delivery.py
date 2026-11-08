@@ -85,6 +85,134 @@ class _ProgressEditor:
         self.last_edit = now
 
 
+
+
+def format_file_size(num_bytes: int) -> str:
+    """Format a byte count for concise Telegram captions."""
+    size = max(0, float(num_bytes or 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _audio_caption(metadata, kind: str, size: int, source: str = "") -> str:
+    get = metadata.get if isinstance(metadata, dict) else lambda key, default="": getattr(metadata, key, default)
+    title = get("album_title") or get("title", "")
+    artist = get("artist", "") or "Unknown Artist"
+    heading = f"<b>{kind}: {html.escape(str(title))}</b>"
+    caption = (
+        f"🌙 {heading}\n🎧 {html.escape(str(artist))}\n"
+        f"📦 <b>Size:</b> {format_file_size(size)}"
+    )
+    if source:
+        caption += f"\nSource: {html.escape(str(source))}"
+    return caption
+
+
+
+
+def _audio_thumbnail(metadata):
+    data = metadata.get("cover_data") if isinstance(metadata, dict) else getattr(metadata, "cover_data", None)
+    if not data:
+        return None
+    try:
+        image = Image.open(BytesIO(data)).convert("RGB")
+        image.thumbnail((320, 320))
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=85)
+        return BufferedInputFile(output.getvalue(), filename="cover.jpg")
+    except (OSError, ValueError):
+        return None
+
+
+def _audio_duration(metadata, track, path: Path) -> int | None:
+    value = track.get("duration") or track.get("duration_ms")
+    if not value and isinstance(metadata, dict):
+        for row in metadata.get("tracks_api_data", []):
+            if str(row.get("id", "")) == str(track.get("SNG_ID", "")):
+                value = row.get("duration")
+                break
+    if value:
+        value = int(value)
+        return value // 1000 if value > 1000 else value
+    try:
+        return get_audio_duration(str(path))
+    except Exception:
+        return None
+def _thumbnail(cover_data):
+    if not cover_data:
+        return None
+    return BufferedInputFile(cover_data, filename="cover.jpg")
+
+
+async def send_track_audio(event, metadata, track):
+    """Upload one original-format audio attachment without recompression."""
+    path = Path(track["song_path"])
+    get = metadata.get if isinstance(metadata, dict) else lambda key, default="": getattr(metadata, key, default)
+    title = track.get("song_name") or get("title", "") or path.stem
+    artist = track.get("artist_name") or get("artist", "")
+    caption = _audio_caption(metadata, "Track", path.stat().st_size)
+    cover = metadata.get("cover_data") if isinstance(metadata, dict) else getattr(metadata, "cover_data", None)
+    try:
+        caption += f"\n🎵 {html.escape(str(title))}"
+    except (TypeError, ValueError):
+        pass
+    audio = await event.answer_audio(
+        FSInputFile(path),
+        title=str(title), performer=str(artist),
+        thumbnail=_thumbnail(make_audio_thumbnail(cover)),
+        duration=_audio_duration(metadata, track, path),
+        caption=caption, parse_mode="HTML",
+    )
+    if audio:
+        await schedule_messages_deletion([audio], platform_config.auto_delete_seconds())
+    return audio
+
+
+async def send_album_audio(event, metadata, dl_tracks_info):
+    """Send an album header followed by tracks in their original formats."""
+    size = sum(Path(track["song_path"]).stat().st_size for track in dl_tracks_info)
+    caption = _audio_caption(metadata, "Album", size)
+    cover = metadata.get("cover_data") if isinstance(metadata, dict) else getattr(metadata, "cover_data", None)
+    if cover and get_bool_env("SEND_ALBUM_COVER", True):
+        header = await event.answer_photo(
+            BufferedInputFile(prepare_cover_bytes(cover), filename="cover.jpg"), caption=caption, parse_mode="HTML"
+        )
+    else:
+        header = await event.answer(caption, parse_mode="HTML")
+    messages = [header] if header else []
+    for track in dl_tracks_info:
+        audio = await send_track_audio(event, metadata, track)
+        if audio:
+            messages.append(audio)
+    if header:
+        await schedule_messages_deletion([header], platform_config.auto_delete_seconds())
+    return messages
+
+
+async def send_artist_audio(event, metadata, artist_name, artist_dir):
+    """Deliver a discography through the shared release audio workflow."""
+    await event.answer(
+        f"🌕 <b>Artist: {html.escape(artist_name)}</b>\n"
+        f"📦 <b>Size:</b> {format_file_size(sum(p.stat().st_size for p in artist_dir.rglob('*') if p.is_file()))}",
+        parse_mode="HTML",
+    )
+    messages = []
+    from dl_utils import provider_engines
+
+    for release in provider_engines.discover_releases(artist_dir):
+        cover_data = provider_engines.read_cover(release, metadata.artist)
+        release_metadata = provider_engines.infer_release_from_paths(
+            release, metadata.artist, artist_dir=artist_dir
+        )
+        tracks = provider_engines.tracks_from_paths(release, release_metadata)
+        if cover_data:
+            release_metadata.cover_data = cover_data
+        messages.extend(await send_album_audio(event, release_metadata, tracks))
+    return messages
+
 # ---------------------------------------------------------------------------
 # Auto-delete
 # ---------------------------------------------------------------------------
@@ -581,14 +709,20 @@ async def deliver_zip(
                     f"USER_DEBUG: Sending download link to user_id={user_id} "
                     f"username={username} first_name={first_name}"
                 )
-                link_msg = await event.answer(f"Download link: {file_link}")
+                link_msg = await event.answer(
+                    f"📦 <b>Archive Size:</b> {format_file_size(final_zip_path.stat().st_size)} (.zip)\n"
+                    f"Download link: {html.escape(file_link)}",
+                    parse_mode="HTML",
+                )
             else:
                 print(
                     "USER_DEBUG: FILE_LINK_TEMPLATE is empty; "
                     "reporting hosted filename instead of a URL"
                 )
                 link_msg = await event.answer(
-                    f"Archived on server: {final_zip_path.name}"
+                    f"📦 <b>Archive Size:</b> {format_file_size(final_zip_path.stat().st_size)} (.zip)\n"
+                    f"Archived on server: {html.escape(final_zip_path.name)}",
+                    parse_mode="HTML",
                 )
             sent_messages.append(link_msg)
             print(f"Sent download link: {final_zip_path.name}")
@@ -644,10 +778,9 @@ async def deliver_zip(
             for idx, zip_file in enumerate(zip_files_created):
                 try:
                     part_caption = (
-                        f"Zip Archive (Part {idx + 1}/{num_sent})"
-                        if num_sent > 1
-                        else "Zip Archive"
-                    )
+                        f"📦 <b>Part {idx + 1}/{num_sent} Size:</b> "
+                        if num_sent > 1 else "📦 <b>Archive Size:</b> "
+                    ) + format_file_size(zip_file.stat().st_size) + " (.zip)"
                     print(
                         f"USER_DEBUG: Sending zip file {idx + 1}/{num_sent} to "
                         f"user_id={user_id} username={username} first_name={first_name}"
@@ -655,6 +788,7 @@ async def deliver_zip(
                     doc_msg = await event.answer_document(
                         FSInputFile(zip_file),
                         caption=part_caption,
+                        parse_mode="HTML",
                         disable_notification=True,
                     )
                     sent_messages.append(doc_msg)
@@ -694,7 +828,13 @@ def release_zip_names(metadata, is_album: bool) -> tuple[str, str]:
 async def create_and_send_zip(
     event: types.Message, metadata, dl_tracks_info, is_album: bool
 ):
-    """Build the archive for one release and deliver it."""
+    """Deliver native audio or build an archive for one release."""
+    if platform_config.output_format() != "zip":
+        if not is_album and len(dl_tracks_info) == 1:
+            track = dl_tracks_info[0]
+            audio = await send_track_audio(event, metadata, track)
+            return [audio] if audio else []
+        return await send_album_audio(event, metadata, dl_tracks_info)
     user_id, username, first_name = get_user_infos(event)
     print(
         f"USER_DEBUG: Creating and sending zip to user_id={user_id} "
@@ -719,11 +859,25 @@ async def create_and_send_artist_zip(
     """Bundle an entire artist discography into zip archive(s) and send it.
 
     `downloaded_releases` is a list of (release, metadata, dl_tracks_info)
-    tuples. Every release keeps the usual per-release layout, nested one level
-    deeper inside a folder named after the artist. A discography is always
-    delivered as an archive: streaming out hundreds of audio messages would
-    flood the chat and hit Telegram limits.
+    tuples. Every release keeps the usual per-release layout in archive mode;
+    audio mode sends each release header followed by its original tracks.
     """
+    if platform_config.output_format() != "zip":
+        total = sum(
+            Path(track["song_path"]).stat().st_size
+            for _, _, tracks in downloaded_releases for track in tracks
+        )
+        summary = await event.answer(
+            f"🌕 <b>Artist: {html.escape(artist_metadata['name'])}</b>\n"
+            f"📦 <b>Size:</b> {format_file_size(total)}",
+            parse_mode="HTML",
+        )
+        messages = [summary] if summary else []
+        for _, metadata, tracks in downloaded_releases:
+            messages.extend(await send_album_audio(event, metadata, tracks))
+        if summary:
+            await schedule_messages_deletion([summary], platform_config.auto_delete_seconds())
+        return messages
     user_id, username, first_name = get_user_infos(event)
     artist_name = artist_metadata["name"]
     clean_artist_name = artist_metadata["clean_name"]
@@ -763,180 +917,6 @@ async def create_and_send_artist_zip(
 # ---------------------------------------------------------------------------
 # Direct audio sending (FORMAT != zip)
 # ---------------------------------------------------------------------------
-async def send_track_audio(event: types.Message, metadata, dl_track_info):
-    """Send a single track as an audio message."""
-    user_id, username, first_name = get_user_infos(event)
-    print(
-        f"USER_DEBUG: Sending track audio to user_id={user_id} "
-        f"username={username} first_name={first_name}"
-    )
-
-    title = metadata.get("title", dl_track_info["song_name"])
-    caption = get_track_caption(metadata)
-    song_path = dl_track_info["song_path"]
-    duration = get_audio_duration(song_path)
-    # `or` rather than a .get() default: an empty contributors list must still
-    # fall back to the lead artist instead of producing a blank performer.
-    performer = ", ".join(metadata.get("artists_list") or [metadata["artist"]])
-    thumb_data = make_audio_thumbnail(metadata.get("cover_data"))
-    sent_messages = []
-
-    if get_bool_env("SEND_ALBUM_COVER", True):
-        cover_msg = await event.answer_photo(
-            BufferedInputFile(metadata["cover_data"], filename="cover.jpg"),
-            caption=caption,
-            parse_mode="HTML",
-        )
-        sent_messages.append(cover_msg)
-
-    audio_msg = await event.answer_audio(
-        FSInputFile(
-            song_path,
-            filename=(
-                f"{clean_filename(performer)} - {clean_filename(title)}"
-                f"{dl_track_info['file_extension']}"
-            ),
-        ),
-        title=metadata["title"],
-        performer=performer,
-        duration=duration,
-        thumbnail=BufferedInputFile(thumb_data, filename="thumb.jpg") if thumb_data else None,
-        disable_notification=True,
-    )
-    sent_messages.append(audio_msg)
-    await schedule_messages_deletion(sent_messages, platform_config.auto_delete_seconds())
-
-
-async def send_album_audio(event: types.Message, metadata, dl_tracks_info):
-    """Send album tracks as audio messages (media group, else individually)."""
-    user_id, username, first_name = get_user_infos(event)
-    print(
-        f"USER_DEBUG: Sending album audio to user_id={user_id} "
-        f"username={username} first_name={first_name}"
-    )
-
-    caption = get_album_caption(metadata)
-    sent_messages = []
-    auto_delete_seconds = platform_config.auto_delete_seconds()
-
-    # All tracks of an album share one cover, so build the thumbnail once.
-    thumb_data = make_audio_thumbnail(metadata.get("cover_data"))
-
-    if get_bool_env("SEND_ALBUM_COVER", True):
-        cover_msg = await event.answer_photo(
-            BufferedInputFile(metadata["cover_data"], filename="cover.jpg"),
-            caption=caption,
-            parse_mode="HTML",
-        )
-        sent_messages.append(cover_msg)
-
-    api_tracks_by_id = {
-        str(t.get("id", "")): t for t in metadata.get("tracks_api_data", [])
-    }
-    media_group = []
-    processed_files = []
-
-    try:
-        dl_tracks_info.sort(
-            key=lambda t: int(t.get("TRACK_NUMBER", "999"))
-            if str(t.get("TRACK_NUMBER", "999")).isdigit()
-            else 999
-        )
-    except Exception as sort_e:
-        print(f"Warning: Could not sort tracks by track number for sending. Error: {sort_e}")
-
-    for dl_info in dl_tracks_info:
-        song_path = dl_info["song_path"]
-        potential_id = Path(song_path).stem
-        api_track = api_tracks_by_id.get(
-            str(dl_info.get("SNG_ID", ""))
-        ) or api_tracks_by_id.get(potential_id)
-
-        # The album endpoints expose no per-track contributors, so the artist
-        # string built at download time is authoritative; only the title
-        # benefits from the API data.
-        title = api_track.get("title", dl_info["song_name"]) if api_track else dl_info["song_name"]
-        performer = dl_info["artist_name"]
-        duration = get_audio_duration(song_path)
-
-        media_group.append(
-            InputMediaAudio(
-                media=FSInputFile(song_path),
-                filename=(
-                    f"{clean_filename(performer)} - {clean_filename(title)}"
-                    f"{dl_info['file_extension']}"
-                ),
-                title=title,
-                performer=performer,
-                duration=duration,
-                thumbnail=BufferedInputFile(thumb_data, filename="thumb.jpg")
-                if thumb_data
-                else None,
-            )
-        )
-        processed_files.append(
-            {
-                "path": song_path,
-                "title": title,
-                "performer": performer,
-                "duration": duration,
-                "extension": dl_info["file_extension"],
-            }
-        )
-
-    if 2 <= len(media_group) <= 10:
-        try:
-            print(
-                f"Attempting to send album {metadata['id']} as media group "
-                f"({len(media_group)} items)"
-            )
-            group_messages = await event.answer_media_group(
-                media_group, disable_notification=True
-            )
-            sent_messages.extend(group_messages)
-            print("Media group sent successfully.")
-            await schedule_messages_deletion(sent_messages, auto_delete_seconds)
-            return
-        except Exception as e:
-            print(f"Failed to send as media group, sending individually: {e}")
-
-    print(
-        f"Sending album {metadata['id']} tracks individually ({len(processed_files)} items)"
-    )
-    for i, item in enumerate(processed_files):
-        try:
-            print(
-                f"USER_DEBUG: Sending individual track {i + 1}/{len(processed_files)} "
-                f"to user_id={user_id} username={username} first_name={first_name}"
-            )
-            # BufferedInputFile per send avoids FSInputFile reuse issues.
-            with open(item["path"], "rb") as f:
-                audio_data = f.read()
-            audio_msg = await event.answer_audio(
-                BufferedInputFile(
-                    audio_data,
-                    filename=(
-                        f"{clean_filename(item['performer'])} - "
-                        f"{clean_filename(item['title'])}{item['extension']}"
-                    ),
-                ),
-                title=item["title"],
-                performer=item["performer"],
-                duration=item["duration"],
-                thumbnail=BufferedInputFile(thumb_data, filename="thumb.jpg")
-                if thumb_data
-                else None,
-                disable_notification=True,
-            )
-            sent_messages.append(audio_msg)
-            await asyncio.sleep(0.2)
-        except Exception as e:
-            print(f"Error sending individual track {item['title']}: {e}")
-            await event.answer(f"⚠️ Error sending track: {item['title']}")
-
-    await schedule_messages_deletion(sent_messages, auto_delete_seconds)
-
-
 # ---------------------------------------------------------------------------
 # Generic request-failure reporting
 # ---------------------------------------------------------------------------

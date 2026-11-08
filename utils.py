@@ -48,6 +48,52 @@ def get_env_or_token_file(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+def update_token_env_keys(updates: Dict[str, str]) -> bool:
+    """Update token.env in place while retaining comments and existing modes."""
+    import logging
+
+    path = Path(TOKEN_ENV_PATH)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        logging.warning(f"{path} does not exist; creating it")
+        lines = []
+    except OSError as error:
+        logging.error(f"Could not read {path}: {error}")
+        return False
+
+    remaining = dict(updates)
+    for index, line in enumerate(lines):
+        key = line.split("=", 1)[0] if "=" in line else ""
+        if key in remaining:
+            lines[index] = f"{key}={remaining.pop(key)}\n"
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    insert_at = 0
+    for index, line in enumerate(lines):
+        if line.startswith("#"):
+            insert_at = index + 1
+        elif line.strip():
+            break
+    for key, value in remaining.items():
+        lines.insert(insert_at, f"{key}={value}\n")
+        insert_at += 1
+
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.writelines(lines)
+    except OSError as error:
+        logging.error(f"Could not write {path}: {error}")
+        return False
+
+    for key, value in updates.items():
+        os.environ[key] = value
+    return True
+
+
+
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on", "y"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", "n"})
 

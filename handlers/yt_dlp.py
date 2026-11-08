@@ -29,7 +29,7 @@ from utils import (
     request_download,
 )
 from dl_utils import platform_config as pcfg
-from dl_utils.archive_delivery import _ProgressEditor
+from dl_utils.archive_delivery import _ProgressEditor, create_and_send_zip, schedule_messages_deletion
 from dl_utils.deezer_utils import clean_filename
 
 
@@ -74,7 +74,8 @@ def _matched_media_url(text: str, pattern: re.Pattern) -> str:
     return match.group(0).rstrip(").,;'\"") if match else ""
 
 
-COOKIES_PATH = pcfg.get_env_or_token_file("COOKIES_PATH", "").strip() or None
+_cookies_path = pcfg._credential_file_path("COOKIES_PATH")
+COOKIES_PATH = str(_cookies_path) if _cookies_path else None
 
 # Upstream: configurable YouTube player clients
 YT_PLAYER_CLIENT = [
@@ -219,133 +220,22 @@ async def create_and_send_zip_yt(event: types.Message, track_title: str, uploade
     clean_title = clean_filename(track_title)
     clean_artist = clean_filename(uploader)
     year = upload_date[:4] if upload_date and len(upload_date) >= 4 else "Unknown"
-    
-    # Create internal directory name
-    internal_dir_name = clean_filename(f"{clean_artist} - {clean_title}")
-    
-    # Prepare files to zip
-    files_to_zip = {}
-    file_extension = audio_path.suffix
-    
-    # Audio file
-    audio_filename = f"{clean_artist} - {clean_title}{file_extension}"
-    files_to_zip[str(audio_path)] = f"{internal_dir_name}/{audio_filename}"
-    
-    # Cover image if available
-    cover_path = None
-    if cover_data:
-        cover_path = audio_path.parent / "cover.jpg"
-        try:
-            with open(cover_path, "wb") as f:
-                f.write(cover_data)
-            files_to_zip[str(cover_path)] = f"{internal_dir_name}/cover.jpg"
-        except Exception as e:
-            print(f"Error writing cover file: {e}")
-            cover_path = None
-    
-    # Send cover photo with caption
-    caption = f"<b>Track: {track_title}</b>\n{uploader}"
-    if upload_date:
-        try:
-            date_str = f"{upload_date[6:8]}/{upload_date[4:6]}/{upload_date[0:4]}"
-            caption += f" - {date_str}"
-        except:
-            pass
-    if webpage_url:
-        caption += f'\n\n<a href="{webpage_url}">' + __("track_link") + "</a>"
-    
-    if cover_data:
-        try:
-            cover_msg = await event.answer_photo(
-                BufferedInputFile(cover_data, filename="cover.jpg"),
-                caption=caption,
-                parse_mode="HTML",
-            )
-            sent_messages.append(cover_msg)
-        except Exception as e:
-            print(f"Error sending cover photo: {e}")
-    
-    final_title_for_hash = f"{uploader} - {track_title}"
-    md5_hash = hashlib.md5(final_title_for_hash.encode()).hexdigest()[:8]
-    base_zip_name = f"{unidecode(clean_artist)} - {unidecode(clean_title)} ({md5_hash})"
-    safe_base_name = re.sub(r"[^.a-zA-Z0-9()_-]", "_", base_zip_name)
-
-    # Hosting is enabled by COPY_FILES_PATH alone: without FILE_LINK_TEMPLATE
-    # there is no URL to send, but the archive still belongs on the server
-    # rather than being uploaded as a Telegram attachment.
-    if COPY_FILES_PATH:
-        # --- Copy Mode ---
-        print("Using Copy Mode for YouTube/SoundCloud Zip")
-        final_zip_path = Path(COPY_FILES_PATH) / f"{safe_base_name}.zip"
-        final_zip_path.parent.mkdir(parents=True, exist_ok=True)
-
-        print(f"Creating zip file at: {final_zip_path}")
-        try:
-            await asyncio.to_thread(
-                _write_zip_sync, final_zip_path, list(files_to_zip.items())
-            )
-
-            if FILE_LINK_TEMPLATE:
-                file_link = FILE_LINK_TEMPLATE.format(quote(final_zip_path.name))
-                link_msg = await event.answer(f"Download link: {file_link}")
-                print(f"Sent download link: {file_link}")
-            else:
-                print(
-                    "USER_DEBUG: FILE_LINK_TEMPLATE is empty; "
-                    "reporting hosted filename instead of a URL"
-                )
-                link_msg = await event.answer(
-                    f"Archived on server: {final_zip_path.name}"
-                )
-            sent_messages.append(link_msg)
-
-            # Schedule server file deletion
-            server_files_to_delete.append(final_zip_path)
-
-        except Exception as e:
-            print(f"Error creating zip in copy mode: {e}")
-            await event.answer(f"❌ Error creating zip file: {e}")
-    else:
-        # --- Direct Send Mode ---
-        print("Using Direct Send Mode for YouTube/SoundCloud Zip")
-        zip_path = audio_path.parent / f"{safe_base_name}.zip"
-        
-        try:
-            await asyncio.to_thread(
-                _write_zip_sync, zip_path, list(files_to_zip.items())
-            )
-
-            doc_msg = await event.answer_document(
-                FSInputFile(zip_path),
-                caption="Zip Archive",
-                disable_notification=True,
-            )
-            sent_messages.append(doc_msg)
-            
-            # Clean up temp zip
-            if zip_path.exists():
-                zip_path.unlink()
-                
-        except Exception as e:
-            print(f"Error creating/sending zip: {e}")
-            await event.answer(f"❌ Error creating zip file: {e}")
-    
-    # Clean up cover file
-    if cover_path and cover_path.exists():
-        try:
-            cover_path.unlink()
-        except:
-            pass
-    
-    # Schedule auto-deletion
-    await schedule_messages_deletion(sent_messages, AUTO_DELETE_SECONDS)
-    for server_file in server_files_to_delete:
-        await schedule_file_deletion(server_file, AUTO_DELETE_SECONDS)
-    
-    return sent_messages
+    metadata = {
+        "artist": uploader, "title": track_title, "album_title": track_title,
+        "year": year, "release_date": upload_date or "",
+        "clean_artist": clean_artist, "clean_album_title": clean_title,
+        "clean_title": clean_title, "cover_data": cover_data,
+        "album_link": webpage_url or "", "track_link": webpage_url or "",
+        "artists_list": [uploader], "tracks_api_data": [],
+    }
+    track = {
+        "song_path": str(audio_path), "download_dir": str(audio_path.parent),
+        "song_name": track_title, "artist_name": uploader,
+        "file_extension": audio_path.suffix, "TRACK_NUMBER": 1,
+    }
+    return await create_and_send_zip(event, metadata, [track], False)
 
 
-@youtube_router.message(F.text.regexp(YOUTUBE_URL_REGEX))
 async def get_youtube_audio(event: types.Message):
     if not event.from_user:
         return

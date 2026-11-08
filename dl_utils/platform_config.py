@@ -6,6 +6,7 @@ time so live edits to token.env take effect immediately without recreating the
 Docker container.
 """
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -43,29 +44,8 @@ PLATFORM_LABELS = {
     SOUNDCLOUD: "SoundCloud",
 }
 
-# All platforms enabled by default for track/album links; artist discography
-# downloads default ON only for Deezer and OFF for everything else.
-_DEFAULT_ENABLED = {
-    DEEZER: True,
-    QOBUZ: True,
-    TIDAL: True,
-    AMAZON: True,
-    SPOTIFY: True,
-    APPLE: True,
-    YOUTUBE: True,
-    SOUNDCLOUD: True,
-}
-
-_DEFAULT_ARTIST_DOWNLOAD = {
-    DEEZER: True,
-    QOBUZ: False,
-    TIDAL: False,
-    AMAZON: False,
-    SPOTIFY: False,
-    APPLE: False,
-    YOUTUBE: False,
-    SOUNDCLOUD: False,
-}
+_DEFAULT_ENABLED = {platform: True for platform in PLATFORMS}
+_DEFAULT_ARTIST_DOWNLOAD = {platform: False for platform in PLATFORMS}
 
 _ENV_PREFIX = {
     DEEZER: "DEEZER",
@@ -90,15 +70,18 @@ def platform_enabled(platform: str) -> bool:
 
 
 def artist_download_enabled(platform: str) -> bool:
-    if platform != DEEZER:
-        return False
-    return get_bool_env("DEEZER_ARTIST_DOWNLOAD_ENABLED", True)
+    return get_bool_env(
+        _env_key(platform, "ARTIST_DOWNLOAD_ENABLED"),
+        _DEFAULT_ARTIST_DOWNLOAD.get(platform, False),
+    )
 
 
 def artist_disabled_message(platform: str) -> str:
+    label = PLATFORM_LABELS.get(platform, platform)
+    key = _env_key(platform, "ARTIST_DOWNLOAD_ENABLED")
     return (
-        "⚠️ Full artist discography downloads are only supported for Deezer links. "
-        "Please send an album or track link instead."
+        f"🌙 Full artist discography downloads for {label} are disabled "
+        f"({key}=0). Please send an album or track link instead."
     )
 
 
@@ -108,8 +91,8 @@ def fallback_enabled() -> bool:
 
 _CREDENTIAL_REQUIREMENTS = {
     DEEZER: "DEEZER_TOKEN",
-    QOBUZ: "QOBUZ_USER_AUTH_TOKEN + QOBUZ_APP_ID (or QOBUZ_EMAIL + QOBUZ_PASSWORD)",
-    TIDAL: "TIDAL_OAUTH_TOKEN (or TIDAL_USER_ID + TIDAL_ACCESS_TOKEN + TIDAL_REFRESH_TOKEN)",
+    QOBUZ: "QOBUZ_CONFIG_PATH (or QOBUZ_USER_AUTH_TOKEN + QOBUZ_APP_ID)",
+    TIDAL: "TIDAL_CONFIG_PATH (or TIDAL_OAUTH_TOKEN)",
     AMAZON: "AMAZON_DEVICE_TOKEN + AMAZON_WVD_PATH",
     SPOTIFY: "SPOTIFY_COOKIES_PATH + SPOTIFY_WVD_PATH",
     APPLE: "APPLE_COOKIES_PATH or APPLE_MEDIA_USER_TOKEN",
@@ -171,36 +154,90 @@ def has_deezer_credentials() -> bool:
     return len(token) >= _MIN_ARL_LENGTH
 
 
+def _toml_credentials(key: str, section: str) -> dict:
+    if not _credential_file_ready(key):
+        return {}
+    from dl_utils.credential_migrator import read_toml_section, resolve_resource_path
+
+    configured = get_env_or_token_file(key, "").strip()
+    return read_toml_section(resolve_resource_path(configured), section)
+
+
+def qobuz_fields() -> dict:
+    fields = _toml_credentials("QOBUZ_CONFIG_PATH", "qobuz")
+    aliases = (
+        ("email_or_userid", ("QOBUZ_EMAIL_OR_USER_ID", "QOBUZ_USER_ID", "QOBUZ_EMAIL")),
+        ("password_or_token", ("QOBUZ_PASSWORD_OR_TOKEN", "QOBUZ_USER_AUTH_TOKEN", "QOBUZ_PASSWORD")),
+        ("app_id", ("QOBUZ_APP_ID",)),
+        ("secrets", ("QOBUZ_SECRETS",)),
+        ("use_auth_token", ("QOBUZ_USE_AUTH_TOKEN",)),
+    )
+    for target, keys in aliases:
+        for key in keys:
+            value = get_env_or_token_file(key, "").strip()
+            if value:
+                fields[target] = value
+                break
+    if isinstance(fields.get("secrets"), str):
+        fields["secrets"] = [s.strip() for s in fields["secrets"].split(",") if s.strip()]
+    if get_env_or_token_file("QOBUZ_USER_AUTH_TOKEN", "").strip():
+        fields["use_auth_token"] = True
+    elif get_env_or_token_file("QOBUZ_PASSWORD", ""):
+        fields["use_auth_token"] = False
+    return fields
+
+
 def has_qobuz_credentials() -> bool:
-    return (
-        _all_credential("QOBUZ_USER_AUTH_TOKEN", "QOBUZ_APP_ID")
-        or _all_credential("QOBUZ_USER_ID", "QOBUZ_USER_AUTH_TOKEN")
+    fields = qobuz_fields()
+    return bool(
+        (fields.get("email_or_userid") and fields.get("password_or_token"))
+        or _all_credential("QOBUZ_USER_AUTH_TOKEN", "QOBUZ_APP_ID")
         or _all_credential("QOBUZ_USER_ID", "QOBUZ_SECRETS")
-        or _all_credential("QOBUZ_EMAIL", "QOBUZ_PASSWORD")
-        or _all_credential("QOBUZ_EMAIL_OR_USER_ID", "QOBUZ_PASSWORD_OR_TOKEN")
     )
 
 
+def decode_tidal_jwt_claims(token: str) -> dict:
+    """Read public OAuth claims from a JWT payload without verifying it."""
+    try:
+        encoded = token.split(".")[1]
+        encoded += "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    except (IndexError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    aliases = {"uid": "user_id", "exp": "token_expiry", "cc": "country_code", "cid": "client_id"}
+    return {
+        target: str(payload[source])
+        for source, target in aliases.items()
+        if payload.get(source) not in (None, "")
+    }
+
+
 def tidal_oauth_fields() -> dict:
-    fields = {}
+    fields = _toml_credentials("TIDAL_CONFIG_PATH", "tidal")
+    blob = get_env_or_token_file("TIDAL_OAUTH_TOKEN", "").strip()
+    if blob:
+        parsed = _parse_oauth_blob(blob)
+        for key, value in parsed.items():
+            if value not in (None, ""):
+                fields[key] = str(value).strip()
     for key, env in (
         ("user_id", "TIDAL_USER_ID"),
         ("access_token", "TIDAL_ACCESS_TOKEN"),
         ("refresh_token", "TIDAL_REFRESH_TOKEN"),
         ("token_expiry", "TIDAL_TOKEN_EXPIRY"),
+        ("token_type", "TIDAL_TOKEN_TYPE"),
+        ("country_code", "TIDAL_COUNTRY_CODE"),
     ):
         value = get_env_or_token_file(env, "").strip()
         if value:
             fields[key] = value
-
-    blob = get_env_or_token_file("TIDAL_OAUTH_TOKEN", "").strip()
-    if blob:
-        parsed = _parse_oauth_blob(blob)
-        for key in ("user_id", "access_token", "refresh_token", "token_expiry"):
-            if key not in fields:
-                value = parsed.get(key)
-                if value is not None and str(value).strip():
-                    fields[key] = str(value).strip()
+    fields["token_type"] = str(fields.get("token_type") or "Bearer")
+    claims = decode_tidal_jwt_claims(str(fields.get("access_token") or ""))
+    for key in ("user_id", "token_expiry", "country_code", "client_id"):
+        if not fields.get(key) and claims.get(key):
+            fields[key] = claims[key]
     return fields
 
 
@@ -252,11 +289,19 @@ _CREDENTIAL_EXAMPLES = {
 }
 
 
-def _credential_file_ready(key: str) -> bool:
+def _credential_file_path(key: str) -> Path | None:
     configured = get_env_or_token_file(key, "").strip()
     if not configured:
+        return None
+    from dl_utils.credential_migrator import resolve_resource_path
+
+    return resolve_resource_path(configured)
+
+
+def _credential_file_ready(key: str) -> bool:
+    path = _credential_file_path(key)
+    if path is None:
         return False
-    path = Path(configured).expanduser()
     try:
         if path.name.endswith(".example") or not path.is_file() or path.stat().st_size == 0:
             return False
@@ -302,15 +347,15 @@ def spotify_credentials_data(path: Path) -> dict | None:
 
 
 def _spotify_auth_ready() -> bool:
-    cookies = get_env_or_token_file("SPOTIFY_COOKIES_PATH", "").strip()
+    cookies = _credential_file_path("SPOTIFY_COOKIES_PATH")
     if cookies and _credential_file_ready("SPOTIFY_COOKIES_PATH"):
-        if spotify_cookie_values(Path(cookies).expanduser()).get("sp_dc"):
+        if spotify_cookie_values(cookies).get("sp_dc"):
             return True
-    legacy = get_env_or_token_file("SPOTIFY_CREDENTIALS_PATH", "").strip()
+    legacy = _credential_file_path("SPOTIFY_CREDENTIALS_PATH")
     return bool(
         legacy
         and _credential_file_ready("SPOTIFY_CREDENTIALS_PATH")
-        and spotify_credentials_data(Path(legacy).expanduser())
+        and spotify_credentials_data(legacy)
     )
 
 
@@ -371,7 +416,7 @@ def platform_status(platform: str) -> dict:
         "enabled": platform_enabled(platform),
         "has_credentials": has_credentials(platform),
         "engine": DIRECT_ENGINES.get(platform, "direct"),
-        "artist_download": artist_download_enabled(platform) if platform == DEEZER else None,
+        "artist_download": artist_download_enabled(platform),
     }
 
 
@@ -400,6 +445,11 @@ def auto_delete_enabled() -> bool:
 def auto_delete_seconds() -> int:
     value = get_int_env("AUTO_DELETE_SECONDS", 1800)
     return value if value > 0 else 1800
+
+
+def streamrip_max_connections() -> int:
+    value = get_int_env("STREAMRIP_MAX_CONNECTIONS", 3)
+    return value if value > 0 else 3
 
 
 def copy_files_path() -> str:

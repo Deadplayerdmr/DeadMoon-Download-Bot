@@ -509,8 +509,9 @@ class TestDeezerReExports(unittest.TestCase):
         self.assertTrue(callable(self.deezer._safe_delete))
 
     def test_artist_toggle_default_matches_config(self):
-        """Deezer is the one platform with artist downloads on by default."""
-        self.assertTrue(pcfg.artist_download_enabled(pcfg.DEEZER))
+        """Every platform, including Deezer, requires an explicit artist opt-in."""
+        for platform in pcfg.PLATFORMS:
+            self.assertFalse(pcfg.artist_download_enabled(platform), platform)
 
 
 if __name__ == "__main__":

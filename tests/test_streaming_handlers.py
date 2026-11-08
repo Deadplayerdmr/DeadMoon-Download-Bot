@@ -215,7 +215,8 @@ class TestRefusalDoesNotConsumeASlot(StreamingCaseBase):
         await st._handle_artist(event, link)
 
         self.assertEqual(self.active_count(), 0, "a disabled feature still took a slot")
-        self.assertIn("only supported for Deezer", event.last_answer)
+        self.assertIn("Tidal", event.last_answer)
+        self.assertIn("TIDAL_ARTIST_DOWNLOAD_ENABLED=0", event.last_answer)
         self.assertIn("album or track", event.last_answer)
 
     async def test_unrouted_link_is_ignored_silently(self):

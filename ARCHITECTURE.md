@@ -11,15 +11,15 @@ Lineage: the bot shell came from `kernoeb/Telegramusic`, the Deezer algorithm fr
 
 ## 1. Purpose and shape
 
-A whitelisted Telegram bot turns a streaming-platform link into a zip of tagged audio,
-delivered back to Telegram or as a hosted link. Archives are staged under a temp tree,
+A whitelisted Telegram bot turns a streaming-platform link into original-format Telegram
+audio (the default) or a zip of tagged audio delivered to Telegram or as a hosted link. Archives are staged under a temp tree,
 consumed by an external MIR analysis pipeline, and purged on a timer (`AUTO_DELETE_SECONDS`,
 default 1800s). The bot is a **transient acquisition front-end**, not a library: no
 retention path exists, and nothing should be added that creates one.
 
 Two constraints shape the whole design:
 
-1. **One link → one archive, identically laid out, regardless of platform.** The downstream
+1. **One link → one shared delivery workflow. ZIP output is identically laid out regardless of platform; audio output preserves native codecs.** The downstream
    analyzer parses folder and filename structure, so layout drift is a pipeline break, not
    a cosmetic difference. `dl_utils/archive_delivery.py` is the single owner of layout.
 2. **Scarce, rate-limited upstream and one Telegram identity.** Download concurrency is
@@ -42,17 +42,22 @@ handlers/
 dl_utils/
   link_resolver.py          offline classify() + async shortlink expansion (aiohttp+certifi)
   provider_engines.py       Direct CLI dispatch + optional Deezer ARL fallback, staging,
+                            Tidal bearer/expiry/refresh synchronization,
                             workdir → EngineResult discovery
   metadata_bridge.py        canonical metadata from public endpoints (iTunes, Deezer,
-                            Odesli/song.link, Spotify oEmbed) — names the archive
-  archive_delivery.py       build_release_entries, zip/multipart writers, captions, hashing,
+                            Odesli/song.link, Tidal API/public-search fallback, Spotify oEmbed)
+  archive_delivery.py       shared native-audio/ZIP delivery, exact size captions,
+                            build_release_entries, zip/multipart writers, captions, hashing,
                             schedule_messages_deletion / schedule_file_deletion
+  credential_migrator.py    atomic 0600 resource writes, inline → file migration, host/container paths
+  admin_auth.py             Tidal OAuth device network boundary, Qobuz discovery worker
+  ascii_art.py              12-frame TTY boot animation / single Docker-log-safe rendering
   deezer_download.py        Deezer cryptographic download algorithm (ARC4 + MD5 obfuscation)
   deezer_utils.py           Deezer helpers: key derivation, lyric/album fetch, search
 arl_fetcher/                optional bun/TypeScript helper that logs in and prints an ARL
 local_resources/            operator credential/cookie files + sanitized templates
 langs.json                  string → locale → text; __() indexes it
-tests/                      392 offline tests; no network, no Telegram, no credentials
+tests/                      413 offline tests; no network, no Telegram, no credentials
 ```
 
 Boundary rules that matter:
@@ -84,8 +89,9 @@ Telegram update
                                           └─ provider_engines.download_release()
                                               ├─ direct: streamrip / dotify-cli / gamdl / amazon-cli
                                               └─ optional: Deezer ARL cross-match fallback
-                                                  └─ archive_delivery.build_release_entries()
-                                                      └─ deliver_zip / create_and_send_zip
+                                                  └─ create_and_send_zip (shared delivery router)
+                                                      ├─ FORMAT=audio → original codec attachments + exact size captions
+                                                      └─ FORMAT=zip → build_release_entries → deliver_zip
                                                           ├─ COPY_FILES_PATH set → hashed zip + FILE_LINK_TEMPLATE link
                                                           └─ unset → Telegram upload, <48MB multipart splits
                                                               └─ schedule_messages_deletion / schedule_file_deletion
@@ -258,7 +264,7 @@ Deezer object, then reuses the existing ARL downloader.
 - `_TOKEN_ENGINES` entries all have the signature `(url, kind, workdir)`. Qobuz and Tidal
   share `download_via_streamrip`, bound with `functools.partial`.
 - `platform_status()` exposes `enabled`, `has_credentials`, `engine`, and
-  `artist_download` (non-null only for Deezer). `/status` never derives routing from a mode.
+  `artist_download` (a boolean for every platform, default `False`). `/status` never derives routing from a mode.
 
 Engines: `download_via_streamrip` (Qobuz/Tidal), `download_via_dotify` (Spotify),
 `download_via_gamdl` (Apple), and `download_via_amazon_cli` (Amazon). Deezer uses
@@ -328,6 +334,43 @@ There is no `|| true` on any engine install. Masked failures previously produced
 image that silently degraded every request; the final `RUN` smoke-tests the engine entry
 points and critical imports so a broken engine fails the build instead.
 
+
+## 7a. Credential ownership and administrator authentication
+
+`token.env` retains feature flags and `*_PATH` links. Multi-field Tidal, Qobuz and Apple
+credentials live in `local_resources/tidal_config.toml`, `qobuz_config.toml`, and
+`apple_cookies.txt`. `dl_utils/credential_migrator.py` runs both from `update.sh` and
+`main.py::main()`; after a successful resource write it sets the path key and blanks inline
+secret fields. Inline environment values still override TOML fields for compatibility and
+emergency rotation. Explicit temporary paths must never be rewritten to repository paths;
+only absent `/usr/src/app/local_resources/<name>` paths fall back to the host checkout.
+
+New credential files use `os.open(..., O_WRONLY | O_CREAT | O_TRUNC, 0o600)`. This applies
+permissions at creation without chmod'ing an existing bind-mounted host inode. Resource
+writes never log tokens. Compose deliberately mounts `local_resources` read-write so admin
+authentication and refreshed Tidal tokens persist.
+
+`main.py` gates `/authenticate*` and `/cancelauth` with `F.from_user.id == ADMIN_ID`.
+Tidal device authorization and polling network I/O live in `dl_utils/admin_auth.py`; only
+one polling task per admin is tracked. Completion writes TOML, enables Tidal, blanks inline
+values, and removes the task. Qobuz discovery runs in a worker thread. Apple writes three
+Netscape `media-user-token` rows. Spotify and Amazon have no paste-only auth command because
+they require provisioned binary WVD material.
+
+For Tidal, `_configure_tidal()` always supplies `Bearer`, uses JWT claims for missing user,
+expiry and country fields, and avoids refresh on a still-valid token. Streamrip is capped at
+30 requests/minute and `STREAMRIP_MAX_CONNECTIONS`. Refreshed tokens are synchronized back
+to the credential resource. `_progress_from_output()` excludes traceback/Rich boxes and
+401/403/429 lines so errors never masquerade as track progress.
+
+## 7b. Public status versus administrator status
+
+`handlers/streaming.py::public_platforms_board()` is the sole public `/start` and `/help`
+board. It iterates `pcfg.PLATFORMS`, rendering enabled/disabled state and optional artist
+availability only. It must never expose engines, credential readiness, queue state, active
+IDs, hosting, or technical defaults. `status_report()` remains the full admin-only report
+behind `F.from_user.id == ADMIN_ID` and keeps the `DeadMoon Status Report` heading.
+
 ## 8. Packaging and delivery (`dl_utils/archive_delivery.py`)
 
 Canonical layout, every platform:
@@ -336,6 +379,17 @@ Canonical layout, every platform:
 single/album : <Artist> - <Album> [Year]/NN - <Artist> - <Title>.<ext> + cover.jpg
 artist       : <Artist>/<Artist> - <Album> [Year]/NN - <Artist> - <Title>.<ext> + cover.jpg
 ```
+
+`create_and_send_zip()` and `create_and_send_artist_zip()` are delivery routers, not a
+request to always create a ZIP: any `FORMAT` other than `zip` sends native audio attachments.
+Tracks use `send_track_audio`; albums use a header followed by ordered `answer_audio` calls;
+artist mode sends a summary and repeats album delivery per release. No codec conversion is
+performed. Captions include exact on-disk track/total audio sizes. All returned messages are
+registered with the existing auto-deletion scheduler. `deliver_zip()` itself always builds a
+ZIP for backward-compatible direct callers and unit tests.
+
+ZIP captions and hosted-link messages include exact archive size; multipart delivery reports
+each part's size. `format_file_size()` is the shared byte formatter.
 
 `build_release_entries(metadata, dl_tracks_info, parent_dir=None)` produces the entry list;
 `parent_dir` is what nests a release under an artist folder. `_write_zip_sync` and
@@ -475,12 +529,12 @@ wrong and hard to notice.
   `os.open(path, O_WRONLY|O_CREAT|O_TRUNC, 0o600)` — the mode applies at creation, and
   because umask only clears bits it cannot weaken 0600. Applied in
   `provider_engines._streamrip_config()` and `_apple_cookies_file()`, and in
-  `main.set_deezer_token()` for the fresh-`token.env` case. `os.open` deliberately does not
+  `utils.update_token_env_keys()` and `dl_utils/credential_migrator.py` for fresh files. `os.open` deliberately does not
   alter an *existing* file's mode, which is what keeps `set_deezer_token` from chmod'ing the
   host's bind-mounted `token.env`.
 - **`MAX_ARTIST_RELEASES` is enforced before download**, so a 400-release artist costs
   nothing. Moving that check after the fetch turns a polite refusal into wasted work.
-- **Artist toggles default off everywhere but Deezer.** Intentional: discography pulls are
+- **Artist toggles default off on every platform, including Deezer.** Intentional: discography pulls are
   the only unbounded-cost operation in the bot.
 - **`data/` is gitignored** and holds only runtime state such as the whitelist. Real files
   under `local_resources/` are also ignored; only the README and sanitized templates ship.
