@@ -91,12 +91,15 @@ class TestMigration(CredentialIsolation):
         self.assertNotIn("refresh;with spaces", self.token.read_text())
         self.assertNotIn("p@ss; word", self.token.read_text())
 
-    def test_inline_environment_overrides_toml_and_explicit_path_is_preserved(self):
+    def test_toml_credentials_override_stale_inline_values(self):
         tidal = self.root / "custom-tidal.toml"
         cm.write_tidal_credentials({"user_id": "1", "access_token": "file", "refresh_token": "r"}, tidal)
         os.environ["TIDAL_CONFIG_PATH"] = str(tidal)
         os.environ["TIDAL_ACCESS_TOKEN"] = "environment"
-        self.assertEqual(pcfg.tidal_oauth_fields()["access_token"], "environment")
+        os.environ["TIDAL_OAUTH_TOKEN"] = '{"access_token": "stale-json", "refresh_token": "stale-refresh"}'
+        self.assertEqual(pcfg.tidal_oauth_fields()["access_token"], "file")
+        self.assertEqual(pcfg.tidal_oauth_fields()["refresh_token"], "r")
+        os.environ.pop("TIDAL_OAUTH_TOKEN")
         self.assertEqual(pcfg._credential_file_path("TIDAL_CONFIG_PATH"), tidal)
         os.environ.pop("TIDAL_ACCESS_TOKEN")
         self.assertEqual(pcfg.tidal_oauth_fields()["access_token"], "file")

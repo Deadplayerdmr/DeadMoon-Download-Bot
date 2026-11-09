@@ -352,6 +352,57 @@ class TestQobuzMetadata(ProductionCase):
 
 
 class TestMetadataLabelMerging(unittest.TestCase):
+    @staticmethod
+    def _image(size):
+        from io import BytesIO
+        from PIL import Image
+
+        output = BytesIO()
+        Image.new("RGB", (size, size), (20, 30, 40)).save(output, "JPEG")
+        return output.getvalue()
+
+    def test_cover_urls_request_provider_maximum_sizes(self):
+        cases = {
+            "https://i.scdn.co/image/ab67616d00001e02abc": "https://i.scdn.co/image/ab67616d0000b273abc",
+            "https://e-cdns-images.dzcdn.net/images/cover/hash/500x500-000000-100-0-0.jpg": "https://e-cdns-images.dzcdn.net/images/cover/hash/1200x1200-000000-100-0-0.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/Music/abc/100x100bb.jpg": "https://is1-ssl.mzstatic.com/image/thumb/Music/abc/1200x1200bb.jpg",
+            "https://resources.tidal.com/images/a/b/c/640x640.jpg": "https://resources.tidal.com/images/a/b/c/1280x1280.jpg",
+            "https://static.qobuz.com/images/covers/a/b_600.jpg": "https://static.qobuz.com/images/covers/a/b_max.jpg",
+            "https://i1.sndcdn.com/artworks-a-large.jpg": "https://i1.sndcdn.com/artworks-a-t500x500.jpg",
+        }
+        for original, upgraded in cases.items():
+            with self.subTest(original=original):
+                self.assertEqual(mb.upgrade_cover_url(original), upgraded)
+
+    def test_spotify_oembed_artist_fallback_does_not_leave_unknown(self):
+        from dl_utils import dotify_shim
+
+        entity = {"trackList": [{"subtitle": "Coasting"}]}
+        with mock.patch.object(mb, "_fetch_json", new=mock.AsyncMock(return_value={
+            "title": "Album Title", "thumbnail_url": "https://i.scdn.co/image/ab67616d00001e02abc"
+        })), mock.patch.object(mb, "page_metadata", new=mock.AsyncMock(return_value=None)), mock.patch.object(
+            dotify_shim, "embed_entity", return_value=entity
+        ):
+            result = asyncio.run(mb.spotify_oembed("https://open.spotify.com/album/abc"))
+        self.assertEqual(result["artist"], "Coasting")
+        self.assertIn("0000b273", result["thumbnail"])
+
+    def test_merge_keeps_higher_resolution_cover_and_valid_artist(self):
+        engine = pe.ReleaseMetadata(artist="Engine Artist", cover_data=self._image(1200))
+        bridge = mb.ReleaseInfo(artist="Unknown Artist", cover_data=self._image(300))
+        merged = mb.merge_info(engine, bridge)
+        self.assertEqual(merged["artist"], "Engine Artist")
+        self.assertEqual(merged["cover_data"], engine.cover_data)
+
+    def test_cover_preparation_preserves_large_photo_dimensions(self):
+        from io import BytesIO
+        from PIL import Image
+        from dl_utils import archive_delivery as ad
+
+        prepared = ad.prepare_cover_bytes(self._image(1200))
+        with Image.open(BytesIO(prepared)) as image:
+            self.assertEqual(image.size, (1200, 1200))
+
     def test_enrichment_preserves_engine_source_and_measured_quality(self):
         engine = pe.ReleaseMetadata(
             artist="Engine Artist",

@@ -36,9 +36,9 @@ def embed_entity(kind: str, object_id: str, timeout: int = 20) -> dict:
     return entity
 
 
-def _public_track_context(track_id: str, timeout: int = 20) -> dict:
+def _public_track_context(track_id: str, timeout: int = 20, kind: str = "track") -> dict:
     response = requests.get(
-        f"https://open.spotify.com/track/{track_id}", timeout=timeout
+        f"https://open.spotify.com/{kind}/{track_id}", timeout=timeout
     )
     response.raise_for_status()
     description = re.search(
@@ -52,19 +52,34 @@ def _public_track_context(track_id: str, timeout: int = 20) -> dict:
     fields = unescape(description.group(1)).split(" · ")
     if len(fields) < 2:
         raise ValueError("Spotify public track album context was not present")
-    return {
-        "name": fields[1],
+    context = {
+        "name": fields[1] if kind == "track" else "",
         "release_date": unescape(release_date.group(1)) if release_date else "",
     }
+    if kind == "album":
+        context["artist"] = fields[0]
+    return context
 
 
 def _artist(entity: dict) -> str:
+    artist = entity.get("subtitle") or entity.get("artist") or ""
     artists = entity.get("artists") or []
     if artists:
-        if isinstance(artists[0], str):
-            return artists[0]
-        return artists[0].get("name") or "Unknown Artist"
-    return entity.get("subtitle") or entity.get("artist") or "Unknown Artist"
+        first = artists[0]
+        if isinstance(first, str):
+            artist = artist or first
+        elif isinstance(first, dict):
+            artist = artist or first.get("name") or first.get("title") or ""
+    if not artist or str(artist).strip().casefold() == "unknown artist":
+        artist = next(
+            (
+                str(track.get("subtitle") or track.get("artist") or "").strip()
+                for track in entity.get("trackList") or []
+                if str(track.get("subtitle") or track.get("artist") or "").strip()
+            ),
+            "",
+        )
+    return str(artist).strip() or "Unknown Artist"
 
 
 def _artist_objects(entity: dict) -> list[dict]:
@@ -83,16 +98,20 @@ def _integer(value, default: int) -> int:
 
 
 def _images(entity: dict) -> list[dict]:
+    from dl_utils.metadata_bridge import upgrade_cover_url
+
     images = entity.get("visualIdentity", {}).get("image") or []
-    return [
-        {
-            "url": image["url"],
-            "width": image.get("maxWidth", 0),
-            "height": image.get("maxHeight", 0),
-        }
-        for image in images
-        if image.get("url")
-    ]
+    images = [image for image in images if image.get("url")]
+    if not images:
+        return []
+    image = max(images, key=lambda item: _integer(
+        item.get("maxWidth") or item.get("width"), 0
+    ))
+    return [{
+        "url": upgrade_cover_url(image["url"]),
+        "width": image.get("maxWidth") or image.get("width") or 0,
+        "height": image.get("maxHeight") or image.get("height") or 0,
+    }]
 
 
 def _release_date(entity: dict) -> str:
@@ -154,6 +173,13 @@ def _track(entity: dict, track_id: str, album: dict | None = None) -> dict:
 @functools.lru_cache(maxsize=32)
 def album_metadata(album_id: str) -> dict:
     entity = embed_entity("album", album_id)
+    if _artist(entity) == "Unknown Artist":
+        try:
+            context = _public_track_context(album_id, kind="album")
+            if context.get("artist"):
+                entity = {**entity, "subtitle": context["artist"]}
+        except Exception as error:
+            print(f"[spotify] public album artist fallback failed: {error}")
     album = _album(entity, album_id)
     tracks = [
         item

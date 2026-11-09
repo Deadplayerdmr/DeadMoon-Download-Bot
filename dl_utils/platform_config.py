@@ -69,6 +69,10 @@ def platform_enabled(platform: str) -> bool:
     )
 
 
+def send_album_cover() -> bool:
+    return get_bool_env("SEND_ALBUM_COVER", True)
+
+
 def artist_download_enabled(platform: str) -> bool:
     return get_bool_env(
         _env_key(platform, "ARTIST_DOWNLOAD_ENABLED"),
@@ -216,11 +220,12 @@ def decode_tidal_jwt_claims(token: str) -> dict:
 
 def tidal_oauth_fields() -> dict:
     fields = _toml_credentials("TIDAL_CONFIG_PATH", "tidal")
+    file_keys = set(fields)
     blob = get_env_or_token_file("TIDAL_OAUTH_TOKEN", "").strip()
     if blob:
         parsed = _parse_oauth_blob(blob)
         for key, value in parsed.items():
-            if value not in (None, ""):
+            if value not in (None, "") and key not in file_keys:
                 fields[key] = str(value).strip()
     for key, env in (
         ("user_id", "TIDAL_USER_ID"),
@@ -231,13 +236,15 @@ def tidal_oauth_fields() -> dict:
         ("country_code", "TIDAL_COUNTRY_CODE"),
     ):
         value = get_env_or_token_file(env, "").strip()
-        if value:
+        if value and key not in file_keys:
             fields[key] = value
-    fields["token_type"] = str(fields.get("token_type") or "Bearer")
     claims = decode_tidal_jwt_claims(str(fields.get("access_token") or ""))
     for key in ("user_id", "token_expiry", "country_code", "client_id"):
         if not fields.get(key) and claims.get(key):
             fields[key] = claims[key]
+    if claims.get("country_code"):
+        fields["country_code"] = claims["country_code"]
+    fields["token_type"] = "Bearer"
     return fields
 
 

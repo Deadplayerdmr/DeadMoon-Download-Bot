@@ -3,13 +3,84 @@
 import asyncio
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import utils
+from dl_utils import admin_auth
 from dl_utils import credential_migrator as cm
+
+
+
+class TidalDeviceOAuthTests(unittest.IsolatedAsyncioTestCase):
+    def test_scope_is_space_separated_for_form_encoding(self):
+        self.assertEqual(admin_auth.TIDAL_SCOPE, "r_usr w_usr w_sub")
+        self.assertNotIn("+", admin_auth.TIDAL_SCOPE)
+
+    @staticmethod
+    def _session():
+        session = mock.MagicMock()
+        session.__aenter__ = mock.AsyncMock(return_value=session)
+        session.__aexit__ = mock.AsyncMock(return_value=None)
+        return session
+
+    async def test_device_code_accepts_real_camel_case_payload(self):
+        payload = {
+            "deviceCode": "device-code",
+            "userCode": "ABCD",
+            "verificationUri": "link.tidal.com",
+            "verificationUriComplete": "link.tidal.com/ABCD",
+            "expiresIn": 300,
+            "interval": 5,
+        }
+        session = self._session()
+        with mock.patch.object(admin_auth.aiohttp, "ClientSession", return_value=session), mock.patch.object(
+            admin_auth, "_post_oauth", new=mock.AsyncMock(return_value=(200, payload))
+        ):
+            device = await admin_auth.request_tidal_device_code()
+
+        self.assertEqual(device, {
+            "device_code": "device-code",
+            "user_code": "ABCD",
+            "verification_uri": "link.tidal.com",
+            "verification_uri_complete": "https://link.tidal.com/ABCD",
+            "expires_in": 300,
+            "interval": 5,
+        })
+
+    async def test_poll_waits_for_pending_then_normalizes_camel_case_token(self):
+        access_token = pcfg_jwt(uid="999", cc="GB", exp=2000000000)
+        responses = [
+            (400, {"error": "authorization_pending"}),
+            (400, {"error": "slow_down"}),
+            (400, {"sub_status": 1002}),
+            (200, {
+                "accessToken": access_token,
+                "refreshToken": "refresh-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600,
+                "user": {"userId": 12345, "countryCode": "US"},
+            }),
+        ]
+        session = self._session()
+        before = int(time.time())
+        with mock.patch.object(admin_auth.aiohttp, "ClientSession", return_value=session), mock.patch.object(
+            admin_auth, "_post_oauth", new=mock.AsyncMock(side_effect=responses)
+        ) as post, mock.patch.object(admin_auth.asyncio, "sleep", new=mock.AsyncMock()) as sleep:
+            fields = await admin_auth.poll_tidal_device_token("device-code", interval=5, expires_in=60)
+
+        self.assertEqual(post.await_count, 4)
+        self.assertEqual(sleep.await_count, 3)
+        self.assertEqual(fields["access_token"], access_token)
+        self.assertEqual(fields["refresh_token"], "refresh-token")
+        self.assertEqual(fields["token_type"], "Bearer")
+        self.assertEqual(fields["user_id"], 12345)
+        self.assertEqual(fields["country_code"], "GB")
+        self.assertEqual(fields["token_expiry"], "2000000000")
+        self.assertGreaterEqual(int(fields["token_expiry"]), before)
 
 
 class AdminCommandTests(unittest.TestCase):
@@ -38,6 +109,17 @@ class AdminCommandTests(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self.old_env)
         self.temp.cleanup()
+
+    def test_deezer_commands_have_distinct_usage_strings(self):
+        for command in ("/authenticatedeezer", "/newarl"):
+            with self.subTest(command=command):
+                self.message.reply.reset_mock()
+                self.message.text = command
+                asyncio.run(self.main.authenticate_deezer(self.message))
+                self.assertEqual(
+                    self.message.reply.await_args.args[0],
+                    f"❌ Usage: `{command} <token>`",
+                )
 
     def test_deezer_saves_and_refreshes(self):
         arl = "a" * 60
@@ -74,6 +156,21 @@ class AdminCommandTests(unittest.TestCase):
     @staticmethod
     async def _pending_auth():
         return asyncio.create_task(asyncio.sleep(60))
+
+    def test_tidal_completion_uses_jwt_claim_fallbacks(self):
+        access_token = pcfg_jwt(uid="12345", cc="DE", exp=2000000000)
+        fields = {"access_token": access_token, "refresh_token": "refresh"}
+        notice = mock.AsyncMock()
+        with mock.patch.object(
+            self.main.admin_auth, "poll_tidal_device_token",
+            new=mock.AsyncMock(return_value=fields),
+        ), mock.patch.object(cm, "write_tidal_credentials", return_value=self.root / "tidal.toml") as write:
+            asyncio.run(self.main._complete_tidal_device_auth(
+                {"device_code": "device", "interval": 1, "expires_in": 60}, notice
+            ))
+        saved = write.call_args.args[0]
+        self.assertEqual(saved["user_id"], "12345")
+        self.assertEqual(saved["country_code"], "DE")
 
     def test_tidal_paste_mode_warns_about_web_player(self):
         token = pcfg_jwt(uid="1", exp=2000000000, cid=3235)

@@ -1,3 +1,5 @@
+import json
+import base64
 """Offline checks for the direct-engine engine install: imports, CLI entry points, pins.
 
 The engine dependency graph in requirements.txt + the Dockerfile overrides three
@@ -15,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -25,6 +28,505 @@ os.environ.setdefault("TELEGRAM_TOKEN", "123456:TEST")
 
 def _have(module: str) -> bool:
     return importlib.util.find_spec(module) is not None
+
+
+
+class TestStreamripTidalRunner(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _error(status):
+        import aiohttp
+
+        return aiohttp.ClientResponseError(
+            request_info=None, history=(), status=status, message="Unauthorized"
+        )
+
+    @staticmethod
+    def _client():
+        import types
+
+        return types.SimpleNamespace(
+            config=types.SimpleNamespace(token_type="", access_token="secret-token"),
+            session=types.SimpleNamespace(headers={}),
+        )
+
+    def test_command_uses_runner_and_connection_limit(self):
+        from dl_utils import provider_engines as pe
+
+        command = pe._streamrip_command(Path("/tmp/config.toml"), "https://tidal.com/album/1")
+        self.assertEqual(command[1:3], ["-m", "dl_utils.streamrip_runner"])
+        self.assertIn("--max-connections", command)
+        self.assertIn("--no-progress", command)
+
+    async def test_login_enforces_bearer_before_and_after_streamrip_login(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                assert self.config.token_type == "Bearer"
+                assert self.session.headers["Authorization"] == "Bearer secret-token"
+                self.session.headers["Authorization"] = " secret-token"
+                return "logged-in"
+
+            async def _api_request(self, path, params=None, base="https://tidal.com/v1"):
+                return {}
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        result = await self._run_login(FakeClient, client)
+        self.assertEqual(result, "logged-in")
+        self.assertEqual(client.config.token_type, "Bearer")
+        self.assertEqual(client.session.headers["Authorization"], "Bearer secret-token")
+
+    @staticmethod
+    async def _run_login(client_class, client):
+        return await client_class._login_by_access_token(client, "secret-token", "1")
+
+    def test_patch_replaces_module_and_class_client_credentials(self):
+        from streamrip.client import tidal as tidal_module
+        from dl_utils import streamrip_runner
+
+        class FakeClient:
+            CLIENT_ID = "old-id"
+            CLIENT_SECRET = "old-secret"
+
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://api.tidal.com/v1"):
+                return {}
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        self.assertEqual(tidal_module.CLIENT_ID, streamrip_runner.TIDAL_CLIENT_ID)
+        self.assertEqual(tidal_module.CLIENT_SECRET, streamrip_runner.TIDAL_CLIENT_SECRET)
+        self.assertEqual(tidal_module.AUTH.login, streamrip_runner.TIDAL_CLIENT_ID)
+        self.assertEqual(tidal_module.AUTH.password, streamrip_runner.TIDAL_CLIENT_SECRET)
+        self.assertEqual(FakeClient.CLIENT_ID, streamrip_runner.TIDAL_CLIENT_ID)
+        self.assertEqual(FakeClient.CLIENT_SECRET, streamrip_runner.TIDAL_CLIENT_SECRET)
+
+    async def test_valid_jwt_skips_premature_refresh(self):
+        import base64
+        import json
+        import time
+        from dl_utils import streamrip_runner
+
+        expiry = int(time.time()) + 600
+        payload = base64.urlsafe_b64encode(json.dumps({"exp": expiry}).encode()).decode().rstrip("=")
+        token = f"header.{payload}.signature"
+        client = self._client()
+        client.config.access_token = token
+        client.config.refresh_token = "refresh"
+        client.config.user_id = "1"
+        client.token_expiry = 1
+        client.global_config = types.SimpleNamespace(
+            session=types.SimpleNamespace(downloads=types.SimpleNamespace(verify_ssl=True))
+        )
+        calls = []
+
+        class FakeClient:
+            async def login(self):
+                raise AssertionError("upstream prematurely refreshed the token")
+
+            async def get_session(self, verify_ssl=True):
+                calls.append(("session", verify_ssl))
+                return self.session
+
+            async def _login_by_access_token(self, token, user_id):
+                calls.append(("login", token, user_id))
+
+            async def _refresh_access_token(self):
+                raise AssertionError("refresh must not run")
+
+            async def _api_request(self, path, params=None, base="https://api.tidal.com/v1"):
+                return {}
+
+        client.session = types.SimpleNamespace(headers={})
+        client.get_session = types.MethodType(FakeClient.get_session, client)
+        streamrip_runner.patch_tidal_client(FakeClient)
+        await FakeClient.login(client)
+        self.assertEqual(calls, [("session", True), ("login", token, "1")])
+        self.assertTrue(client.logged_in)
+
+    async def test_refresh_retries_without_scope_and_verifies_token(self):
+        import base64
+        import json
+        import time
+        from dl_utils import streamrip_runner
+
+        expiry = int(time.time()) + 3600
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"exp": expiry, "cc": "CA"}).encode()
+        ).decode().rstrip("=")
+        token = f"header.{payload}.signature"
+        client = self._client()
+        client.config.user_id = "1"
+        client.config.refresh_token = "refresh"
+        client.refresh_token = "refresh"
+        posts = []
+        session_requests = []
+
+        class Response:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def json(self, content_type=None):
+                return {"status": 200, "userId": 1, "countryCode": "CA"}
+
+        class Session:
+            def __init__(self):
+                self.headers = {}
+
+            def get(self, url, headers=None):
+                session_requests.append((url, headers))
+                return Response()
+
+        client.session = Session()
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://api.tidal.com/v1"):
+                return {}
+
+            async def _api_post(self, url, data, auth=None):
+                posts.append((url, data.copy(), auth))
+                if "scope" in data:
+                    return {"status": 403, "error": "invalid_scope"}
+                return {"access_token": token, "refresh_token": "rotated", "expires_in": 3600}
+
+            async def _refresh_access_token(self):
+                raise AssertionError("replaced by patch")
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        await FakeClient._refresh_access_token(client)
+        self.assertEqual(len(posts), 2)
+        self.assertIn("scope", posts[0][1])
+        self.assertNotIn("scope", posts[1][1])
+        self.assertEqual(posts[1][2].login, streamrip_runner.TIDAL_CLIENT_ID)
+        self.assertEqual(session_requests[0][0], "https://api.tidal.com/v1/sessions")
+        self.assertEqual(client.config.access_token, token)
+        self.assertEqual(client.refresh_token, "rotated")
+        self.assertEqual(client.config.token_expiry, expiry)
+        self.assertEqual(client.config.country_code, "CA")
+
+    async def test_api_request_retries_tidal_host_with_bearer(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+        calls = []
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://tidal.com/v1"):
+                calls.append((path, params, base, self.session.headers["Authorization"]))
+                if base == "https://tidal.com/v1":
+                    raise TestStreamripTidalRunner._error(401)
+                return {"manifest": "ok"}
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        result = await FakeClient._api_request(client, "tracks/1", {"audioquality": "LOSSLESS"})
+        self.assertEqual(result, {"manifest": "ok"})
+        self.assertEqual([call[2] for call in calls], ["https://tidal.com/v1", "https://api.tidal.com/v1"])
+        self.assertTrue(all(call[3] == "Bearer secret-token" for call in calls))
+        self.assertEqual(calls[0][1], calls[1][1])
+
+    async def test_lyrics_auth_and_missing_errors_do_not_abort_tracks(self):
+        from dl_utils import streamrip_runner
+
+        for first_status, retry_status in ((401, 403), (403, 404), (404, None)):
+            with self.subTest(first_status=first_status, retry_status=retry_status):
+                client = self._client()
+                calls = []
+
+                class FakeClient:
+                    async def _login_by_access_token(self, token, user_id):
+                        return None
+
+                    async def _api_request(self, path, params=None, base="https://tidal.com/v1"):
+                        calls.append(base)
+                        status = first_status if len(calls) == 1 else retry_status
+                        raise TestStreamripTidalRunner._error(status)
+
+                streamrip_runner.patch_tidal_client(FakeClient)
+                result = await FakeClient._api_request(client, "tracks/1/lyrics")
+                self.assertEqual(result, {})
+                expected_calls = 1 if first_status == 404 else 2
+                self.assertEqual(len(calls), expected_calls)
+
+    async def test_streamrip_non_streamable_lyrics_404_is_nonfatal(self):
+        from streamrip.exceptions import NonStreamableError
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://listen.tidal.com/v1"):
+                raise NonStreamableError("TIDAL: Track not found")
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        result = await FakeClient._api_request(client, "tracks/1/lyrics")
+        self.assertEqual(result, {})
+
+
+    async def test_non_lyrics_retry_failure_remains_fatal(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://tidal.com/v1"):
+                raise TestStreamripTidalRunner._error(401)
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        with self.assertRaises(Exception) as raised:
+            await FakeClient._api_request(client, "tracks/1/playbackinfopostpaywall")
+        self.assertEqual(getattr(raised.exception, "status", None), 401)
+
+
+    async def test_playback_retries_hosts_and_lower_quality_without_client_header(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+        client.session.headers["x-tidal-token"] = "conflicting-client"
+        calls = []
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://api.tidalhifi.com/v1"):
+                calls.append((base, params.copy(), dict(self.session.headers)))
+                if params["audioquality"] != "LOSSLESS":
+                    raise TestStreamripTidalRunner._error(401)
+                return {
+                    "audioQuality": "LOSSLESS",
+                    "manifestMimeType": "application/vnd.tidal.bts",
+                    "manifest": base64.b64encode(json.dumps({
+                        "codecs": "flac", "encryptionType": "NONE", "urls": ["https://example.invalid/flac"]
+                    }).encode()).decode(),
+                }
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        result = await FakeClient._api_request(
+            client, "tracks/1/playbackinfopostpaywall", {"audioquality": "HI_RES"}
+        )
+        self.assertEqual(result["audioQuality"], "LOSSLESS")
+        self.assertEqual(
+            [(base, params["audioquality"]) for base, params, _ in calls],
+            [
+                ("https://api.tidalhifi.com/v1", "HI_RES_LOSSLESS"),
+                ("https://api.tidal.com/v1", "HI_RES_LOSSLESS"),
+                ("https://desktop.tidal.com/v1", "HI_RES_LOSSLESS"),
+                ("https://api.tidalhifi.com/v1", "HI_RES"),
+                ("https://api.tidal.com/v1", "HI_RES"),
+                ("https://desktop.tidal.com/v1", "HI_RES"),
+                ("https://api.tidalhifi.com/v1", "LOSSLESS"),
+            ],
+        )
+        self.assertTrue(all("x-tidal-token" not in headers for _, _, headers in calls))
+        self.assertTrue(all(
+            sum(key.casefold() == "authorization" for key in headers) == 1
+            for _, _, headers in calls
+        ))
+        self.assertTrue(all(headers["Authorization"] == "Bearer secret-token" for _, _, headers in calls))
+
+    async def test_playback_rejects_aac_downgrade_without_high_or_low_fallback(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+        calls = []
+        aac = {
+            "audioQuality": "HIGH",
+            "manifestMimeType": "application/vnd.tidal.bts",
+            "manifest": base64.b64encode(json.dumps({
+                "codecs": "mp4a.40.2", "encryptionType": "NONE", "urls": ["https://example.invalid/aac"]
+            }).encode()).decode(),
+        }
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://api.tidalhifi.com/v1"):
+                calls.append(params["audioquality"])
+                return aac
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        from streamrip.exceptions import NonStreamableError
+        with self.assertRaises(NonStreamableError):
+            await FakeClient._api_request(
+                client, "tracks/1/playbackinfopostpaywall", {"audioquality": "HI_RES"}
+            )
+        self.assertEqual(len(calls), 18)
+        self.assertNotIn("HIGH", calls)
+        self.assertNotIn("LOW", calls)
+        self.assertTrue(all(not streamrip_runner._lossless_manifest(aac, quality) for quality in (
+            "HI_RES_LOSSLESS", "HI_RES", "LOSSLESS"
+        )))
+
+    async def test_dash_flac_manifest_is_accepted_and_downloadable(self):
+        from dl_utils import streamrip_runner
+
+        response = {
+            "audioQuality": "HI_RES_LOSSLESS", "bitDepth": 24, "sampleRate": 48000,
+            "manifestMimeType": "application/dash+xml",
+            "manifest": base64.b64encode(
+                b'<MPD mediaPresentationDuration="PT10S"><Representation codecs="fLaC" bandwidth="1000000" /></MPD>'
+            ).decode(),
+        }
+        self.assertTrue(streamrip_runner._lossless_manifest(response, "HI_RES_LOSSLESS"))
+        kind, manifest = streamrip_runner._decode_manifest(response)
+        self.assertEqual(kind, "dash")
+        self.assertEqual(streamrip_runner._manifest_codecs(kind, manifest), "fLaC")
+        client = self._client()
+        downloadable = await streamrip_runner._downloadable_from_manifest(client, response)
+        self.assertEqual(downloadable.extension, "flac")
+        self.assertEqual(await downloadable.size(), 1250000)
+
+    async def test_playback_substatus_4005_retries_with_jwt_country(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+        client.config.country_code = "CA"
+        client.session.headers["X-Tidal-Token"] = "conflicting-client"
+        calls = []
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://api.tidalhifi.com/v1"):
+                calls.append((base, params.copy(), dict(self.session.headers)))
+                if params["audioquality"] == "HI_RES_LOSSLESS":
+                    return {"status": 200, "subStatus": 4005}
+                return {
+                    "audioQuality": "HI_RES_LOSSLESS", "bitDepth": 24,
+                    "manifestMimeType": "application/dash+xml",
+                    "manifest": base64.b64encode(b'<MPD><Representation codecs="flac" /></MPD>').decode(),
+                }
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        result = await FakeClient._api_request(
+            client, "tracks/1/playbackinfopostpaywall", {"audioquality": "HI_RES", "countryCode": "US"}
+        )
+        self.assertEqual(result["audioQuality"], "HI_RES_LOSSLESS")
+        self.assertEqual(
+            [call[1]["audioquality"] for call in calls],
+            ["HI_RES_LOSSLESS", "HI_RES_LOSSLESS", "HI_RES_LOSSLESS", "HI_RES"],
+        )
+        self.assertTrue(all(call[1]["countryCode"] == "CA" for call in calls))
+        self.assertTrue(all(
+            not any(key.casefold() == "x-tidal-token" for key in headers)
+            for _, _, headers in calls
+        ))
+
+    async def test_playback_falls_back_to_playbackinfo(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+        calls = []
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://api.tidalhifi.com/v1"):
+                calls.append((path, base, params.copy()))
+                raise TestStreamripTidalRunner._error(403)
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        with self.assertRaises(Exception):
+            await FakeClient._api_request(
+                client, "tracks/1/playbackinfopostpaywall", {"audioquality": "HI_RES"}
+            )
+        self.assertEqual(len(calls), 18)
+        self.assertTrue(calls[-1][0].endswith("/playbackinfo"))
+        self.assertEqual([call[2]["audioquality"] for call in calls[-3:]], ["LOSSLESS"] * 3)
+
+    async def test_get_downloadable_retries_nonstreamable_manifest(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+        client.config.country_code = "US"
+        calls = []
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://api.tidalhifi.com/v1"):
+                calls.append(params["audioquality"])
+                return {
+                    "audioQuality": "HI_RES_LOSSLESS", "bitDepth": 24,
+                    "manifestMimeType": "application/dash+xml",
+                    "manifest": base64.b64encode(
+                        b'<MPD mediaPresentationDuration="PT2S"><Representation codecs="flac" bandwidth="8000" /></MPD>'
+                    ).decode(),
+                }
+
+            async def get_downloadable(self, track_id, quality):
+                raise AssertionError("upstream parser must not receive a DASH manifest")
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        downloadable = await FakeClient.get_downloadable(client, "1", 3)
+        self.assertEqual(downloadable.extension, "flac")
+        self.assertEqual(calls, ["HI_RES_LOSSLESS"])
+
+    async def test_api_post_enforces_bearer(self):
+        from dl_utils import streamrip_runner
+
+        client = self._client()
+        seen = []
+
+        class FakeClient:
+            async def _login_by_access_token(self, token, user_id):
+                return None
+
+            async def _api_request(self, path, params=None, base="https://api.tidal.com/v1"):
+                return {}
+
+            async def _api_post(self, url, data, auth=None):
+                seen.append((url, data, auth, self.session.headers["Authorization"]))
+                return {"ok": True}
+
+        streamrip_runner.patch_tidal_client(FakeClient)
+        result = await FakeClient._api_post(client, "https://auth.example/token", {"grant": "refresh"}, "auth")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(seen[0][3], "Bearer secret-token")
+
+    def test_jwt_country_overrides_conflicting_inline_country(self):
+        from unittest import mock
+        from dl_utils import platform_config as pcfg
+
+        import base64
+        import json
+
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"uid": 209656887, "exp": 2000000000, "cc": "CA"}).encode()
+        ).decode().rstrip("=")
+        token = f"header.{payload}.signature"
+        fields = {
+            "user_id": "209656887", "access_token": token, "refresh_token": "refresh",
+            "country_code": "US", "token_expiry": "2000000000", "token_type": "not-bearer",
+        }
+        with mock.patch.object(pcfg, "_toml_credentials", return_value=fields), mock.patch.object(
+            pcfg, "get_env_or_token_file", side_effect=lambda key, default="": "US" if key == "TIDAL_COUNTRY_CODE" else default
+        ):
+            resolved = pcfg.tidal_oauth_fields()
+        self.assertEqual(resolved["country_code"], "CA")
+        self.assertEqual(resolved["token_type"], "Bearer")
 
 
 def _cli(name: str) -> str | None:
@@ -125,6 +627,77 @@ class TestStreamripOverrides(unittest.TestCase):
         self.assertEqual(loaded.qobuz.app_id, "9999")
         self.assertEqual(loaded.qobuz.secrets, ["aaa", "bbb"])
         self.assertEqual(loaded.downloads.requests_per_minute, 30)
+
+    def test_generated_tidal_config_matches_real_schema(self):
+        import dataclasses
+
+        from streamrip.config import Config, TidalConfig
+
+        from dl_utils import platform_config as pcfg
+        from dl_utils import provider_engines as pe
+
+        fields = {
+            "user_id": 123,
+            "country_code": "US",
+            "access_token": "test-access-token",
+            "refresh_token": "test-refresh-token",
+            "token_expiry": 2000000000,
+            "token_type": "Bearer",
+        }
+        with unittest.mock.patch.object(pcfg, "has_tidal_credentials", return_value=True), unittest.mock.patch.object(
+            pcfg, "tidal_oauth_fields", return_value=fields
+        ):
+            path = pe._streamrip_config(pcfg.TIDAL, Path(self.tmp.name))
+        accepted = {item.name for item in dataclasses.fields(TidalConfig)}
+        import tomlkit
+        document = tomlkit.parse(path.read_text())
+        self.assertEqual(document["tidal"]["token_type"], "Bearer")
+        self.assertLessEqual(set(document["tidal"]) - {"token_type"}, accepted)
+        if "token_type" in accepted:
+            loaded = Config(str(path)).session.tidal
+            self.assertEqual(loaded.token_type, "Bearer")
+            self.assertEqual(loaded.quality, 3)
+        else:
+            from unittest import mock
+            from dl_utils import streamrip_runner
+
+            argv = ["rip", "--config-path", str(path)]
+            with mock.patch.object(sys, "argv", argv):
+                runtime_path, original_path, temporary = streamrip_runner._runtime_config_path()
+            try:
+                loaded = Config(runtime_path).session.tidal
+                self.assertEqual(loaded.quality, 3)
+                self.assertEqual(original_path, str(path))
+                self.assertNotIn("token_type", tomlkit.parse(Path(runtime_path).read_text())["tidal"])
+            finally:
+                temporary.cleanup()
+        for key in ("user_id", "country_code", "access_token", "refresh_token", "token_expiry"):
+            self.assertIsInstance(document["tidal"][key], str)
+
+    def test_real_config_loads_bearer_with_token_type_schema(self):
+        import dataclasses
+        from unittest import mock
+
+        import streamrip.config as streamrip_config
+
+        from dl_utils import platform_config as pcfg
+        from dl_utils import provider_engines as pe
+
+        @dataclasses.dataclass(slots=True)
+        class TokenTypeTidalConfig(streamrip_config.TidalConfig):
+            token_type: str = ""
+
+        fields = {
+            "user_id": "123", "country_code": "US", "access_token": "access",
+            "refresh_token": "refresh", "token_expiry": "2000000000",
+        }
+        with mock.patch.object(pcfg, "has_tidal_credentials", return_value=True), mock.patch.object(
+            pcfg, "tidal_oauth_fields", return_value=fields
+        ):
+            path = pe._streamrip_config(pcfg.TIDAL, Path(self.tmp.name))
+        with mock.patch.object(streamrip_config, "TidalConfig", TokenTypeTidalConfig):
+            loaded = streamrip_config.Config(str(path)).session.tidal
+        self.assertEqual(loaded.token_type, "Bearer")
 
     def setUp(self):
         import tempfile

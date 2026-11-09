@@ -30,10 +30,12 @@ import json
 import re
 import ssl
 from dataclasses import dataclass, field
+from io import BytesIO
 from urllib.parse import quote
 
 import aiohttp
 import certifi
+from PIL import Image
 
 from dl_utils import platform_config as pcfg
 from dl_utils.link_resolver import (
@@ -201,20 +203,72 @@ async def _fetch_json(
         return None
 
 
+def upgrade_cover_url(url: str) -> str:
+    """Request the largest provider artwork variant without rewriting its path shape."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if "i.scdn.co/image/" in url or "spotifycdn.com/image/" in url:
+        return re.sub(r"ab67616d0000(?:4851|1e02)", "ab67616d0000b273", url)
+    if "dzcdn.net/images/cover/" in url:
+        return re.sub(r"/(?:250|500|1000)x(?:250|500|1000)-", "/1200x1200-", url)
+    if "mzstatic.com" in url:
+        return re.sub(r"/\d+x\d+(bb|png|jpg)?", "/1200x1200\\1", url)
+    if "resources.tidal.com/images/" in url:
+        return re.sub(r"/\d+x\d+\.jpg(?=$|[?#])", "/1280x1280.jpg", url)
+    if "static.qobuz.com/images/covers/" in url:
+        return re.sub(r"_(?:230|600)\.jpg(?=([?#]|$))", "_max.jpg", url)
+    if "sndcdn.com" in url:
+        return re.sub(r"-large\.(jpg|png)(?=([?#]|$))", r"-t500x500.\1", url)
+    return url
+
+
+def cover_url_candidates(url: str) -> list[str]:
+    """Ordered high-resolution request and provider-specific fallbacks."""
+    upgraded = upgrade_cover_url(url)
+    candidates = [upgraded] if upgraded else []
+    fallback = ""
+    if "i.scdn.co/image/" in url or "spotifycdn.com/image/" in url:
+        if "ab67616d0000b273" in upgraded:
+            fallback = upgraded.replace("ab67616d0000b273", "ab67616d000082c1")
+        elif "ab67616d000082c1" in upgraded:
+            fallback = upgraded.replace("ab67616d000082c1", "ab67616d0000b273")
+    elif "dzcdn.net/images/cover/" in url and "/1200x1200-" in upgraded:
+        fallback = upgraded.replace("/1200x1200-", "/1000x1000-")
+    elif "mzstatic.com" in url and "/1200x1200" in upgraded:
+        fallback = re.sub(r"/1200x1200", "/600x600", upgraded)
+    elif "static.qobuz.com/images/covers/" in url and "_max.jpg" in upgraded:
+        fallback = upgraded.replace("_max.jpg", "_600.jpg")
+    elif "sndcdn.com" in url and "-t500x500." in upgraded:
+        fallback = re.sub(r"-t500x500\.", "-large.", upgraded)
+    if fallback and fallback not in candidates:
+        candidates.append(fallback)
+    if url and url not in candidates:
+        candidates.append(url)
+    return candidates
+
+
 async def fetch_bytes(url: str) -> bytes | None:
-    """Download an image (album art) with the shared session."""
-    session = await _SESSION.get()
-    for attempt in range(_ATTEMPTS):
-        try:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                data = await resp.read()
-                if data:
-                    return data
-                return None
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"[meta] art fetch failed ({url}), attempt {attempt + 1}: {e}")
-            await asyncio.sleep(0.8 * (attempt + 1))
+    """Download the best available artwork, falling back on non-200 responses."""
+    urls = cover_url_candidates(url) or [url]
+    for candidate_index, candidate in enumerate(urls):
+        session = await _SESSION.get()
+        for attempt in range(_ATTEMPTS):
+            try:
+                async with session.get(candidate) as resp:
+                    if resp.status != 200:
+                        print(f"[meta] art fetch failed ({candidate}): HTTP {resp.status}")
+                        break
+                    data = await resp.read()
+                    if data:
+                        return data
+                    break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"[meta] art fetch failed ({candidate}), attempt {attempt + 1}: {e}")
+                await asyncio.sleep(0.8 * (attempt + 1))
+        if candidate_index + 1 < len(urls):
+            print(f"[meta] trying artwork fallback {urls[candidate_index + 1]}")
+    return None
 
 
 _ITUNES_SEARCH = "https://itunes.apple.com/search"
@@ -282,7 +336,7 @@ async def qobuz_public(kind: str, object_id: str) -> ReleaseInfo | None:
         album_title=album_title,
         year=_year_from(date),
         release_date=date[:10],
-        cover_url=image.get("large") or image.get("extralarge") or image.get("small") or "",
+        cover_url=upgrade_cover_url(image.get("large") or image.get("extralarge") or image.get("small") or ""),
         album_link=link if kind == KIND_ALBUM else f"https://open.qobuz.com/album/{album.get('id')}",
         track_link=link if kind == KIND_TRACK else "",
         tracks=tracks,
@@ -358,7 +412,7 @@ async def deezer_search(term: str, kind: str) -> ReleaseInfo | None:
         album_title=album.get("title", "") if kind == KIND_TRACK else item.get("title", ""),
         year=_year_from(date),
         release_date=date[:10],
-        cover_url=item.get("cover_xl") or item.get("cover_big") or album.get("cover_xl", ""),
+        cover_url=upgrade_cover_url(item.get("cover_xl") or item.get("cover_big") or album.get("cover_xl", "")),
         track_link=link if kind == KIND_TRACK else album.get("link", ""),
         album_link=link if kind == KIND_ALBUM else album.get("link", ""),
         source="deezer-search",
@@ -409,10 +463,9 @@ async def public_search_metadata(
 # iTunes Lookup (Apple Music)
 # ---------------------------------------------------------------------------
 def _apple_artwork(url: str, size: int = _APPLE_ART_MAX) -> str:
-    """Request the largest JPEG the CDN will serve for an artwork URL."""
-    if not url:
-        return ""
-    return re.sub(r"/\d+x\d+(bb|png|jpg)?", f"/{size}x{size}", url)
+    """Request a large JPEG through the shared CDN upgrade policy."""
+    del size
+    return upgrade_cover_url(url)
 
 
 def _year_from(date_str: str) -> str:
@@ -546,10 +599,9 @@ async def itunes_artist(artist_id: str, storefront: str | None = None) -> dict |
 # ---------------------------------------------------------------------------
 # Deezer public API
 # ---------------------------------------------------------------------------
-def _deezer_art(cover: str, size: int = 1000) -> str:
-    if not cover:
-        return ""
-    return re.sub(r"/\d+x\d+", f"{size}x{size}", cover)
+def _deezer_art(cover: str, size: int = 1200) -> str:
+    del size
+    return upgrade_cover_url(cover)
 
 
 async def deezer_album(album_id: str) -> ReleaseInfo | None:
@@ -630,7 +682,7 @@ async def deezer_track(track_id: str) -> ReleaseInfo | None:
         album_title=album.get("title", ""),
         year=_year_from(release_date),
         release_date=release_date,
-        cover_url=_deezer_art(album.get("cover_xl") or album.get("cover_big") or ""),
+        cover_url=_deezer_art(album.get("cover_xl") or album.get("cover_big") or album.get("cover_medium") or ""),
         track_link=payload.get("link", ""),
         album_link=album.get("link", ""),
         tracks=[track],
@@ -702,10 +754,25 @@ async def spotify_oembed(url: str) -> dict | None:
         return None
     title = payload.get("title", "") or ""
     parts = [p.strip() for p in re.split(r"\s+[–—-]\s+", title, maxsplit=1) if p.strip()]
+    artist = parts[0] if len(parts) > 1 else ""
+    if not artist or artist.casefold() == "unknown artist":
+        object_id = url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+        kind = KIND_ALBUM if "/album/" in url else KIND_TRACK
+        info = await page_metadata(url, PLATFORM_SPOTIFY, kind, object_id)
+        if info:
+            artist = info.artist
+        if not artist or artist.casefold() == "unknown artist":
+            try:
+                from dl_utils import dotify_shim
+
+                entity = await asyncio.to_thread(dotify_shim.embed_entity, kind, object_id)
+                artist = dotify_shim._artist(entity)
+            except Exception as error:
+                print(f"[meta] Spotify artist fallback failed: {error}")
     return {
-        "artist": parts[0] if len(parts) > 1 else "",
+        "artist": "" if artist.casefold() == "unknown artist" else artist,
         "title": parts[-1] if parts else title,
-        "thumbnail": payload.get("thumbnail_url", "") or "",
+        "thumbnail": upgrade_cover_url(payload.get("thumbnail_url", "") or ""),
         "provider": payload.get("provider_name", "Spotify"),
     }
 
@@ -757,7 +824,7 @@ async def odesli_links(url: str) -> dict | None:
     return {
         "title": entity.get("title", "") or "",
         "artist": entity.get("artistName", "") or "",
-        "artwork": artwork,
+        "artwork": upgrade_cover_url(artwork),
         "isrc": next(
             (
                 value.get("isrc")
@@ -931,7 +998,7 @@ async def page_metadata(url: str, platform: str, kind: str, object_id: str) -> R
         album_title="" if kind == KIND_TRACK else release_title,
         year=_year_from(structured_date),
         release_date=structured_date[:10],
-        cover_url=_meta_content(text, "og:image") or structured_cover,
+        cover_url=upgrade_cover_url(_meta_content(text, "og:image") or structured_cover),
         source="page-title",
     )
 
@@ -1143,7 +1210,44 @@ def merge_info(engine_metadata, bridge_info: ReleaseInfo | None) -> dict:
         return None
 
     engine = engine_metadata
-    artist = pick(bridge_info and bridge_info.artist, engine and engine.artist, "Unknown Artist")
+
+    def artist_value(*values):
+        for value in values:
+            candidate = str(value or "").strip()
+            if candidate and candidate.casefold() != "unknown artist":
+                return candidate
+        return "Unknown Artist"
+
+    def best_cover(*values):
+        candidates = [value for value in values if value]
+        if not candidates:
+            return None
+
+        def resolution(data):
+            try:
+                with Image.open(BytesIO(data)) as image:
+                    width, height = image.size
+                return width * height, len(data)
+            except Exception:
+                return 0, len(data)
+
+        return max(candidates, key=resolution)
+
+    track_artists = []
+    for track in getattr(engine, "tracks_api_data", None) or []:
+        if not isinstance(track, dict):
+            continue
+        artist_data = track.get("artist")
+        if isinstance(artist_data, dict):
+            artist_data = artist_data.get("name")
+        track_artists.append(
+            track.get("artist_name") or track.get("ART_NAME") or artist_data
+        )
+    artist = artist_value(
+        bridge_info and bridge_info.artist,
+        engine and engine.artist,
+        *track_artists,
+    )
     album_title = pick(
         bridge_info and bridge_info.album_title,
         engine and engine.album_title,
@@ -1151,7 +1255,7 @@ def merge_info(engine_metadata, bridge_info: ReleaseInfo | None) -> dict:
     )
     year = pick(bridge_info and bridge_info.year, engine and engine.year, "")
     release_date = pick(bridge_info and bridge_info.release_date, engine and engine.release_date, "")
-    cover = pick(bridge_info and bridge_info.cover_data, engine and engine.cover_data)
+    cover = best_cover(bridge_info and bridge_info.cover_data, engine and engine.cover_data)
     album_link = pick(bridge_info and bridge_info.album_link, engine and engine.album_link, "")
     track_link = pick(bridge_info and bridge_info.track_link, engine and engine.track_link, "")
 

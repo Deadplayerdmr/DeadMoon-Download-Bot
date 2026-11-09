@@ -19,6 +19,7 @@ services:
       # creation time and never creates the file, which made both commands fail.
       - ./token.env:/usr/src/app/token.env
     restart: always
+    dns: [1.1.1.1, 8.8.8.8]
     env_file:
       - token.env
     environment:

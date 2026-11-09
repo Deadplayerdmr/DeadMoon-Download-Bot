@@ -239,15 +239,17 @@ def downloadpicture(pic_idid):
     if not session:
         raise DeezerApiException("Error: Deezer session not initialized")
 
-    resp = session.get(get_picture_link(pic_idid))
+    for size in (1200, 1000):
+        resp = session.get(get_picture_link(pic_idid, size))
+        if resp.status_code == 200 and resp.content:
+            return resp.content
     resp.raise_for_status()
-    return resp.content
+    raise DeezerApiException("Error: Deezer returned empty album artwork")
 
 
-def get_picture_link(pic_idid):
+def get_picture_link(pic_idid, size=1200):
     setting_domain_img = "https://e-cdns-images.dzcdn.net/images"
-    url = setting_domain_img + "/cover/" + pic_idid + "/1200x1200.jpg"
-    return url
+    return setting_domain_img + "/cover/" + pic_idid + f"/{size}x{size}.jpg"
 
 
 def get_song_url(track_token: str, format: str) -> str:
@@ -440,10 +442,11 @@ def _tag_mp3_file(output_file: str, title: str, artist: str, album_artist: str, 
             audio = MP3(output_file)
             audio.add_tags()
         
-        # Clear existing tags
-        audio.tags.delete(output_file)
+        if audio.tags is not None:
+            audio.tags.delete(output_file)
         audio = MP3(output_file)
-        audio.add_tags()
+        if audio.tags is None:
+            audio.add_tags()
         
         # Add metadata tags
         if title:

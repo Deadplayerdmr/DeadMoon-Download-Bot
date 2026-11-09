@@ -4,11 +4,13 @@
 import asyncio
 import contextvars
 import functools
+import importlib.util
 import inspect
 import os
 import re
 import shutil
 import signal
+import sys
 import tempfile
 import time
 import traceback
@@ -124,6 +126,26 @@ def _engine_env(workdir: Path | None = None) -> dict:
     return env
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_DOTIFY_TRANSIENT_ERRORS = (
+    "[errno -3] try again",
+    "eai_again",
+    "temporary failure in name resolution",
+    "connection reset by peer",
+    "serverdisconnectederror",
+    "timeouterror",
+)
+
+
+def _strip_ansi(value: str) -> str:
+    return _ANSI_ESCAPE.sub("", value)
+
+
+def _dotify_transient_failure(output: str) -> bool:
+    normalized = _strip_ansi(output).casefold()
+    return any(marker in normalized for marker in _DOTIFY_TRANSIENT_ERRORS)
+
+
 _TRACK_OUTPUT = re.compile(
     r"(?:downloading|fetching|preparing)(?:\s+track)?[\s:]*(.+?)(?:\s*\(\d+/\d+\))?$",
     re.I,
@@ -137,6 +159,7 @@ _PROGRESS_ERROR_MARKERS = (
 
 
 def _progress_from_output(line: str, seen_files: set[Path], cwd: Path) -> str | None:
+    line = _strip_ansi(line)
     lowered = line.casefold()
     if any(marker in lowered for marker in _PROGRESS_ERROR_MARKERS):
         return None
@@ -303,7 +326,7 @@ def read_cover(cover_path: str | None, max_bytes: int = 5 * 1024 * 1024) -> byte
         path = Path(cover_path)
         if not path.exists():
             return None
-        if path.stat().st_size <= max_bytes and path.suffix.lower() in (".jpg", ".jpeg"):
+        if path.suffix.lower() in (".jpg", ".jpeg"):
             return path.read_bytes()
         return _reencode_cover(path, max_bytes)
     except Exception as e:
@@ -866,21 +889,23 @@ def _configure_tidal(doc, flac: bool) -> None:
             "or TIDAL_OAUTH_TOKEN."
         )
     fields = pcfg.tidal_oauth_fields()
-    section["token_type"] = str(fields.get("token_type") or "Bearer")
-    section["user_id"] = str(fields["user_id"])
-    section["access_token"] = str(fields["access_token"])
-    section["refresh_token"] = str(fields["refresh_token"])
-    section["country_code"] = str(fields.get("country_code") or "US")
+    section["token_type"] = "Bearer"
+    values = {
+        "user_id": str(fields["user_id"]),
+        "access_token": str(fields["access_token"]),
+        "refresh_token": str(fields["refresh_token"]),
+        "country_code": str(fields.get("country_code") or "US"),
+        "token_type": "Bearer",
+    }
     real_expiry = str(fields.get("token_expiry") or "")
     claims = pcfg.decode_tidal_jwt_claims(str(fields["access_token"]))
     try:
         token_exp = float(claims.get("token_expiry") or real_expiry or 0)
     except (TypeError, ValueError):
         token_exp = 0
-    if token_exp > time.time() + 300:
-        section["token_expiry"] = str(int(time.time()) + 86400 * 30)
-    else:
-        section["token_expiry"] = real_expiry
+    values["token_expiry"] = str(int(token_exp)) if token_exp > 0 else real_expiry
+    for key, value in values.items():
+        section[key] = value
 
 
 def _sync_refreshed_tidal_tokens(config_path: Path, original: dict) -> None:
@@ -894,7 +919,10 @@ def _sync_refreshed_tidal_tokens(config_path: Path, original: dict) -> None:
         doc = parse(config_path.read_text(encoding="utf-8"))
         refreshed = dict(doc.get("tidal", {}))
         access = str(refreshed.get("access_token") or "")
-        if not access or access == str(original.get("access_token") or ""):
+        if not access:
+            return
+        keys = ("access_token", "refresh_token", "token_expiry", "country_code")
+        if all(str(refreshed.get(key) or "") == str(original.get(key) or "") for key in keys):
             return
         fields = {**original, **refreshed}
         if pcfg._credential_file_ready("TIDAL_CONFIG_PATH"):
@@ -911,40 +939,62 @@ def _sync_refreshed_tidal_tokens(config_path: Path, original: dict) -> None:
         print(f"[engine] could not persist refreshed Tidal token: {error}")
 
 
-def _tidal_failure(rc: int, tail: str) -> EngineError:
-    fields = pcfg.tidal_oauth_fields()
-    lowered = tail.casefold()
-    if (
-        str(fields.get("client_id") or "") == "3235"
-        and any(marker in lowered for marker in ("401", "403", "unauthorized", "forbidden"))
-    ):
-        return EngineError(
-            "Tidal token was issued for the Web Player (cid=3235) which Tidal blocks "
-            "from direct stream manifest downloads. Run /authenticatetidal in Telegram "
-            "to link a TV device token via link.tidal.com."
-        )
-    return EngineError(f"streamrip exit {rc}: {tail[-500:]}")
+def _streamrip_error_detail(tail: str) -> str:
+    lines = [
+        re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip(" │\t")
+        for line in tail.splitlines()
+        if line.strip(" │\t")
+    ]
+    return "\n".join(lines[-3:])[-1000:] or "no error output"
 
+
+def _tidal_failure(rc: int, tail: str) -> EngineError:
+    claims = pcfg.decode_tidal_jwt_claims(
+        str(pcfg.tidal_oauth_fields().get("access_token") or "")
+    )
+    detail = _streamrip_error_detail(tail)
+    if str(claims.get("client_id") or "") == "3235":
+        return EngineError(
+            "Tidal token was issued for the Web Player (cid=3235), which Tidal blocks "
+            "from direct stream manifest downloads. Run /authenticatetidal in Telegram "
+            f"to link a TV device token via link.tidal.com.\n{detail}"
+        )
+    lowered = tail.casefold()
+    prefix = "streamrip"
+    if any(marker in lowered for marker in ("401", "403", "unauthorized", "forbidden")):
+        prefix += (
+            ": Tidal API returned HTTP 401/403 Unauthorized. Run /authenticatetidal "
+            "in Telegram to refresh your Tidal TV device login"
+        )
+    else:
+        prefix += f" exit {rc}"
+    return EngineError(f"{prefix}:\n{detail}")
+
+
+
+def _streamrip_command(config_path: Path, url: str) -> list[str]:
+    arguments = [
+        "--config-path", str(config_path),
+        "--max-connections", str(pcfg.streamrip_max_connections()),
+        "--no-progress", "url", url,
+    ]
+    if importlib.util.find_spec("streamrip") is not None:
+        return [sys.executable, "-m", "dl_utils.streamrip_runner", *arguments]
+    rip_bin = _which("rip")
+    if rip_bin:
+        try:
+            shebang = Path(rip_bin).read_text(encoding="utf-8").splitlines()[0]
+            interpreter = shebang[2:].strip() if shebang.startswith("#!") else ""
+            if interpreter and Path(interpreter).is_file():
+                return [interpreter, "-m", "dl_utils.streamrip_runner", *arguments]
+        except (OSError, IndexError):
+            pass
+    return [sys.executable, "-m", "dl_utils.streamrip_runner", *arguments]
 
 
 async def download_via_streamrip(platform: str, url: str, kind: str, workdir: Path, progress_cb=None) -> EngineResult:
-    rip_bin = _which("rip")
     config_path = _streamrip_config(platform, workdir)
-
-    if rip_bin:
-        cmd = [rip_bin, "--config-path", str(config_path), "--no-progress", "url", url]
-    else:
-        cmd = [
-            "python3",
-            "-u",
-            "-c",
-            "import sys; from streamrip.rip import rip; sys.argv=['rip']+sys.argv[1:]; rip()",
-            "--config-path",
-            str(config_path),
-            "--no-progress",
-            "url",
-            url,
-        ]
+    cmd = _streamrip_command(config_path, url)
 
     original_tidal_fields = pcfg.tidal_oauth_fields() if platform == pcfg.TIDAL else {}
     rc, tail = await _invoke_subprocess(_run_subprocess, cmd, workdir, progress_cb)
@@ -952,14 +1002,30 @@ async def download_via_streamrip(platform: str, url: str, kind: str, workdir: Pa
         _sync_refreshed_tidal_tokens(config_path, original_tidal_fields)
     audio, release_dir, _ = discover_release(workdir)
 
-    if rc != 0 and not audio:
+    if rc != 0 or not audio:
+        print(f"[streamrip] {platform} rc={rc} output:\n{tail}")
+    if not audio:
         if platform == pcfg.TIDAL:
             raise _tidal_failure(rc, tail)
-        raise EngineError(f"streamrip exit {rc}: {tail[-500:]}")
-    if not audio:
-        raise EngineError(f"streamrip produced no audio for {url}")
+        raise EngineError(
+            f"streamrip exit {rc} produced no audio for {url}:\n"
+            f"{_streamrip_error_detail(tail)}"
+        )
     if rc != 0:
         print(f"[engine] streamrip partial success (rc={rc}): {tail[-300:]}")
+    if platform == pcfg.TIDAL and pcfg.flac_enabled():
+        for path in audio:
+            try:
+                from mutagen.flac import FLAC
+
+                if path.suffix.lower() != ".flac" or path.read_bytes()[:4] != b"fLaC":
+                    raise EngineError(f"Tidal returned a non-FLAC file: {path.name}")
+                if FLAC(path).info.bits_per_sample < 16:
+                    raise EngineError(f"Tidal returned invalid lossless audio: {path.name}")
+            except EngineError:
+                raise
+            except Exception as error:
+                raise EngineError(f"Tidal FLAC validation failed for {path.name}: {error}") from error
 
     return _result_from_workdir(
         platform, "direct", "streamrip", url, kind, workdir
@@ -1037,6 +1103,42 @@ def _dotify_command(
     ]
 
 
+def _artist_from_audio_tags(tracks: list) -> str:
+    import mutagen
+
+    for track in tracks:
+        try:
+            audio = mutagen.File(str(track.get("song_path") or ""))
+            tags = getattr(audio, "tags", None) or {}
+            for key in ("©ART", "aART", "artist", "ARTIST"):
+                value = tags.get(key)
+                if isinstance(value, (list, tuple)):
+                    value = value[0] if value else ""
+                artist = str(value or "").strip()
+                if artist and artist.casefold() != "unknown artist":
+                    return artist
+        except Exception:
+            continue
+    return ""
+
+
+def _clean_dotify_attempt(workdir: Path, before: set[Path]) -> None:
+    for path in sorted(
+        (item for item in workdir.rglob("*") if item.is_file() and item not in before),
+        reverse=True,
+    ):
+        path.unlink(missing_ok=True)
+    for directory in sorted(
+        (item for item in workdir.rglob("*") if item.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
 async def download_via_dotify(url: str, kind: str, workdir: Path, progress_cb=None) -> EngineResult:
     from dl_utils import dotify_shim
 
@@ -1076,8 +1178,26 @@ async def download_via_dotify(url: str, kind: str, workdir: Path, progress_cb=No
         cmd = _dotify_command(
             dotify_bin, cookies, wvd, workdir, track_url, quality=quality
         )
-        rc, tail = await _invoke_subprocess(_run_subprocess, cmd, workdir, progress_cb)
-        produced_audio = set(find_audio(workdir)) != before
+        attempt_files = set()
+        for attempt in range(3):
+            attempt_before = {path for path in workdir.rglob("*") if path.is_file()}
+            rc, tail = await _invoke_subprocess(_run_subprocess, cmd, workdir, progress_cb)
+            current_audio = set(find_audio(workdir))
+            attempt_files = current_audio - attempt_before
+            if rc == 0 and attempt_files:
+                break
+            if attempt == 2 or not _dotify_transient_failure(tail):
+                break
+            _clean_dotify_attempt(workdir, attempt_before)
+            delay = 1.5 * (2 ** attempt)
+            print(
+                f"[engine] transient dotify-cli network failure; "
+                f"retrying track {track['TRACK_NUMBER']} in {delay:g}s"
+            )
+            await asyncio.sleep(delay)
+        produced_audio = rc == 0 and bool(attempt_files)
+        if not produced_audio:
+            _clean_dotify_attempt(workdir, attempt_before)
         aac_quality = _dotify_aac_fallback(quality)
         if (
             (rc != 0 or not produced_audio)
@@ -1107,7 +1227,7 @@ async def download_via_dotify(url: str, kind: str, workdir: Path, progress_cb=No
             rc, tail = await _invoke_subprocess(_run_subprocess, cmd, workdir, progress_cb)
             produced_audio = set(find_audio(workdir)) != before
         if rc != 0 or not produced_audio:
-            detail = tail[-300:] if tail else "no audio was produced"
+            detail = _strip_ansi(tail)[-300:] if tail else "no audio was produced"
             failures.append(f"Track {track['TRACK_NUMBER']}: {detail}")
             print(f"[engine] Spotify track failed; continuing album: {failures[-1]}")
 
@@ -1135,6 +1255,29 @@ async def download_via_dotify(url: str, kind: str, workdir: Path, progress_cb=No
     ) if kind == KIND_TRACK else result.metadata.album_link
     result.metadata.release_date = album.get("release_date") or result.metadata.release_date
     result.metadata.year = result.metadata.release_date[:4]
+    if str(result.metadata.artist or "").strip().casefold() in ("", "unknown artist"):
+        artist = next(
+            (
+                str(track.get("artist_name") or "").strip()
+                for track in result.tracks
+                if str(track.get("artist_name") or "").strip()
+                and str(track.get("artist_name") or "").strip().casefold() != "unknown artist"
+            ),
+            "",
+        )
+        if not artist:
+            artist = next(
+                (
+                    str(track.get("artist_name") or "").strip()
+                    for track in expected
+                    if str(track.get("artist_name") or "").strip()
+                    and str(track.get("artist_name") or "").strip().casefold() != "unknown artist"
+                ),
+                "",
+            )
+        if not artist:
+            artist = _artist_from_audio_tags(result.tracks)
+        result.metadata.artist = artist or "Unknown Artist"
     result.metadata.artists_list = [result.metadata.artist]
     remaining = list(expected)
     multi_disc = len({item["DISC_NUMBER"] for item in expected}) > 1

@@ -47,6 +47,33 @@ class TestDotifyMetadataShim(unittest.TestCase):
         self.assertEqual(expected[0]["SNG_ID"], "firsttrack")
         self.assertEqual(album["release_date"], "2020-01-02")
 
+    def test_album_artist_falls_back_to_track_and_largest_cover(self):
+        entity = public_album("album-id")
+        entity["subtitle"] = ""
+        entity["visualIdentity"]["image"] = [
+            {"url": "https://i.scdn.co/image/ab67616d00001e02small", "maxWidth": 300},
+            {"url": "https://i.scdn.co/image/ab67616d0000b273large", "maxWidth": 640},
+        ]
+        with mock.patch.object(shim, "embed_entity", return_value=entity):
+            album = shim.album_metadata("album-id")
+        self.assertEqual(album["artists"][0]["name"], "Public Artist")
+        self.assertEqual(album["images"], [{
+            "url": "https://i.scdn.co/image/ab67616d0000b273large",
+            "width": 640, "height": 0,
+        }])
+
+    def test_album_artist_falls_back_to_public_page(self):
+        entity = public_album("album-id")
+        entity["subtitle"] = ""
+        for track in entity["trackList"]:
+            track["subtitle"] = ""
+        with mock.patch.object(shim, "embed_entity", return_value=entity), mock.patch.object(
+            shim, "_public_track_context", return_value={"artist": "Page Artist"}
+        ) as context:
+            album = shim.album_metadata("album-id")
+        self.assertEqual(album["artists"][0]["name"], "Page Artist")
+        context.assert_called_once_with("album-id", kind="album")
+
     def test_standalone_track_uses_public_album_context_and_embed_cover(self):
         entity = {
             "title": "Single", "subtitle": "Singer", "duration": 1234,

@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,56 @@ from dl_utils import platform_config as pcfg
 from dl_utils import provider_engines as pe
 from dl_utils.archive_delivery import append_issue_summary, get_album_caption
 from handlers import deezer
+
+
+class TestDeezerMp3Tags(unittest.TestCase):
+    def test_missing_id3_header_is_initialized_with_metadata_and_cover(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "track.mp3"
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "sine=frequency=1000:duration=0.1",
+                    "-map_metadata", "-1", "-id3v2_version", "0", str(path),
+                ],
+                check=True,
+            )
+            real_deezer._tag_mp3_file(
+                str(path), "Title", "Artist", "Album Artist", "Album",
+                "1", "1", "2026", "Label", "ISRC123", b"cover-image",
+            )
+            from mutagen.id3 import ID3
+
+            tags = ID3(path)
+            self.assertEqual(str(tags["TIT2"]), "Title")
+            self.assertEqual(str(tags["TPE1"]), "Artist")
+            self.assertEqual(str(tags["TPE2"]), "Album Artist")
+            self.assertEqual(str(tags["TALB"]), "Album")
+            self.assertEqual(str(tags["TRCK"]), "1")
+            self.assertEqual(str(tags["TPOS"]), "1")
+            self.assertEqual(str(tags["TDRC"]), "2026")
+            self.assertEqual(str(tags["TPUB"]), "Label")
+            self.assertEqual(str(tags["TSRC"]), "ISRC123")
+            self.assertEqual(tags["APIC:Cover"].data, b"cover-image")
+
+    def test_existing_id3_header_is_replaced_without_duplicate_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "track.mp3"
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "sine=frequency=1000:duration=0.1",
+                    "-metadata", "title=Old title", "-id3v2_version", "3", str(path),
+                ],
+                check=True,
+            )
+            real_deezer._tag_mp3_file(
+                str(path), "New title", "Artist", "Album Artist", "Album",
+                "2", "1", "2026", "Label", "ISRC456", b"",
+            )
+            from mutagen.id3 import ID3
+
+            self.assertEqual(str(ID3(path)["TIT2"]), "New title")
 
 
 class TestNativeDeezerIssues(unittest.IsolatedAsyncioTestCase):

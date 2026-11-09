@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -32,16 +33,23 @@ def resolve_resource_path(configured: str | os.PathLike) -> Path:
 
 
 def atomic_write_text(path: str | os.PathLike, text: str) -> Path:
-    """Create/truncate a credential file with 0600 applying at creation."""
+    """Atomically replace a credential file with owner-only permissions."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(
-        destination,
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-        0o600,
-    )
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
     return destination
 
 
@@ -123,13 +131,16 @@ def write_tidal_credentials(fields: dict, path: str | os.PathLike | None = None)
     from dl_utils import platform_config as pcfg
 
     claims = pcfg.decode_tidal_jwt_claims(str(fields.get("access_token") or ""))
-    merged = {**claims, **{k: v for k, v in fields.items() if v not in (None, "")}}
+    merged = {k: v for k, v in fields.items() if v not in (None, "")}
+    for key in ("user_id", "token_expiry", "country_code"):
+        if claims.get(key):
+            merged[key] = claims[key]
     destination = Path(path) if path else configured_resource_path(
         "TIDAL_CONFIG_PATH", "tidal_config.toml"
     )
     values = {
         "user_id": str(merged.get("user_id") or ""),
-        "token_type": str(merged.get("token_type") or "Bearer"),
+        "token_type": "Bearer",
         "access_token": str(merged.get("access_token") or ""),
         "refresh_token": str(merged.get("refresh_token") or ""),
         "token_expiry": str(merged.get("token_expiry") or ""),

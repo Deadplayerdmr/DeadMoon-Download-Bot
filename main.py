@@ -530,7 +530,9 @@ async def update_arl(message: Message):
     # Extract token from command
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.reply("❌ Usage: `/newarl <token>`", parse_mode="Markdown")
+        command = parts[0].split("@", 1)[0].casefold() if parts else "/newarl"
+        usage = "/authenticatedeezer" if command == "/authenticatedeezer" else "/newarl"
+        await message.reply(f"❌ Usage: `{usage} <token>`", parse_mode="Markdown")
         return
     
     new_token = parts[1].strip()
@@ -612,10 +614,24 @@ async def _complete_tidal_device_auth(device: dict, notice) -> None:
         fields = await admin_auth.poll_tidal_device_token(
             device["device_code"], device.get("interval", 5), device.get("expires_in", 300)
         )
+        claims = pcfg.decode_tidal_jwt_claims(str(fields.get("access_token") or ""))
+        user = fields.get("user") if isinstance(fields.get("user"), dict) else {}
         fields = {
             **fields,
-            "user_id": fields.get("user_id") or fields.get("user", {}).get("id"),
-            "country_code": fields.get("country_code") or fields.get("countryCode") or "US",
+            "user_id": (
+                fields.get("user_id")
+                or fields.get("userId")
+                or user.get("userId")
+                or user.get("id")
+                or claims.get("user_id")
+            ),
+            "country_code": (
+                fields.get("country_code")
+                or fields.get("countryCode")
+                or user.get("countryCode")
+                or claims.get("country_code")
+                or "US"
+            ),
         }
         if not _save_tidal_authentication(fields):
             raise RuntimeError("OAuth response did not contain a complete Tidal credential set.")

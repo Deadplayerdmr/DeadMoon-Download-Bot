@@ -482,54 +482,32 @@ class TestReadCover(WorkdirCase):
         self.assertIsNotNone(data)
         self.assertEqual(data[:3], b"\xff\xd8\xff")
 
-    def test_oversized_cover_is_shrunk_below_the_cap(self):
+    def test_large_jpeg_dimensions_and_bytes_are_preserved(self):
         try:
             from PIL import Image
         except ImportError:
             self.skipTest("Pillow is not installed")
         workdir = self.stage("apple/album/3", "01 - A - B.flac")
         cover = workdir / "cover.jpg"
-        # Noise does not compress, so this reliably exceeds a small cap.
         import random
 
         random.seed(7)
-        noise = bytes(random.randrange(256) for _ in range(300 * 300 * 3))
-        img = Image.frombytes("RGB", (300, 300), noise)
-        img.save(cover, format="JPEG", quality=100)
-        original = cover.stat().st_size
-        self.assertGreater(original, 60_000)
-        # The cap has to stay above the smallest quality rung's output or the
-        # function legitimately returns None; 60 KB is comfortably inside range.
+        noise = bytes(random.randrange(256) for _ in range(1200 * 1200 * 3))
+        Image.frombytes("RGB", (1200, 1200), noise).save(cover, format="JPEG", quality=100)
         data = pe.read_cover(str(cover), max_bytes=60_000)
-        self.assertIsNotNone(data)
-        self.assertLessEqual(len(data), 60_000)
-        self.assertLess(len(data), original)
-        self.assertEqual(data[:3], b"\xff\xd8\xff")
-
-    def test_a_cover_that_cannot_be_compressed_under_the_cap_is_dropped(self):
-        # Better no cover than an archive Telegram refuses to send.
-        try:
-            from PIL import Image
-        except ImportError:
-            self.skipTest("Pillow is not installed")
-        import random
-
-        workdir = self.stage("apple/album/4", "01 - A - B.flac")
-        cover = workdir / "cover.jpg"
-        random.seed(11)
-        noise = bytes(random.randrange(256) for _ in range(200 * 200 * 3))
-        Image.frombytes("RGB", (200, 200), noise).save(cover, format="JPEG", quality=100)
-        self.assertIsNone(pe.read_cover(str(cover), max_bytes=512))
+        self.assertEqual(data, cover.read_bytes())
+        with Image.open(cover) as image:
+            self.assertEqual(image.size, (1200, 1200))
 
     def test_missing_path_and_none_are_both_none(self):
         self.assertIsNone(pe.read_cover(None))
         self.assertIsNone(pe.read_cover(str(self.root / "absent.jpg")))
 
-    def test_corrupt_image_does_not_raise(self):
+    def test_jpeg_signature_is_preserved_for_upstream_validation(self):
         workdir = self.stage("tidal/album/5", "01 - A - B.flac")
         cover = workdir / "cover.jpg"
         cover.write_bytes(b"definitely not a jpeg" * 100)
-        self.assertIsNone(pe.read_cover(str(cover), max_bytes=10))
+        self.assertEqual(pe.read_cover(str(cover), max_bytes=10), cover.read_bytes())
 
 
 # ---------------------------------------------------------------------------
@@ -1003,6 +981,28 @@ class TestDotifyArguments(WorkdirCase):
         self.assertTrue(all(track["file_extension"] == ".m4a" for track in result.tracks))
         self.assertTrue(all(track["SNG_ID"] for track in result.tracks))
 
+    def test_unknown_album_artist_is_recovered_from_downloaded_track(self):
+        metadata = self.metadata((True,))
+        metadata["artists"] = [{"name": "Unknown Artist"}]
+        metadata["tracks"]["items"][0]["artists"] = [{"name": "Unknown Artist"}]
+
+        async def fake_run(cmd, cwd):
+            release = Path(cwd) / "Unknown Artist - Test Album"
+            release.mkdir(exist_ok=True)
+            (release / "01 - Coasting - Song 1.m4a").write_bytes(b"audio")
+            return 0, ""
+
+        with mock.patch.object(pe, "_which", return_value="/usr/bin/dotify"), mock.patch.object(
+            pe, "_spotify_release_metadata", new=mock.AsyncMock(return_value=metadata)
+        ), mock.patch.object(pe, "_run_subprocess", fake_run), mock.patch.object(
+            pe.asyncio, "sleep", new=mock.AsyncMock()
+        ):
+            result = asyncio.run(pe.download_via_dotify(
+                "https://open.spotify.com/album/123", "album", self.workdir
+            ))
+        self.assertEqual(result.metadata.artist, "Coasting")
+        self.assertEqual(result.metadata.artists_list, ["Coasting"])
+
     def test_widevine_403_retries_track_with_aac_and_reuses_it_for_release(self):
         self.set_env(
             SPOTIFY_AUDIO_QUALITY="flac-mp4-24,flac-mp4,vorbis-high,aac-high,aac-medium"
@@ -1122,6 +1122,69 @@ class TestDotifyArguments(WorkdirCase):
 
         with self.assertRaisesRegex(EngineError, "could not download any tracks"):
             self.run_engine(failed)
+
+    def test_transient_network_errors_retry_cleanly_with_backoff(self):
+        self.set_env(SPOTIFY_BULK_WAIT_SECONDS="0")
+        sleep = mock.AsyncMock()
+        calls = []
+        transient = (
+            "[Errno -3] Try again", "EAI_AGAIN",
+            "Temporary failure in name resolution", "Connection reset by peer",
+            "ServerDisconnectedError", "TimeoutError",
+        )
+        for marker in transient:
+            with self.subTest(marker=marker):
+                for path in pe.find_audio(self.workdir):
+                    path.unlink()
+                calls.clear()
+                sleep.reset_mock()
+
+                async def fake_run(cmd, cwd):
+                    calls.append(marker)
+                    if len(calls) < 3:
+                        partial = Path(cwd) / f"partial-{len(calls)}.m4a"
+                        partial.write_bytes(b"partial")
+                        return 1, f"\x1b[31m{marker}\x1b[0m"
+                    release = Path(cwd) / "Test Artist - Test Album"
+                    release.mkdir(exist_ok=True)
+                    (release / "01 - Test Artist - Song 1.m4a").write_bytes(b"audio")
+                    return 0, ""
+
+                result = self.run_engine(fake_run, playable=(True,), sleep=sleep)
+                self.assertEqual(len(calls), 3)
+                self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.5, 3.0])
+                self.assertFalse((self.workdir / "partial-1.m4a").exists())
+                self.assertFalse((self.workdir / "partial-2.m4a").exists())
+                self.assertEqual(len(result.tracks), 1)
+
+    def test_transient_failure_stops_after_two_retries_and_strips_ansi(self):
+        self.set_env(SPOTIFY_BULK_WAIT_SECONDS="0")
+        sleep = mock.AsyncMock()
+        calls = []
+
+        async def fake_run(cmd, cwd):
+            calls.append(cmd)
+            (Path(cwd) / f"partial-{len(calls)}.tmp").write_bytes(b"partial")
+            return 1, "\x1b[31m[ERROR 01:01:16]\x1b[0m EAI_AGAIN"
+
+        with self.assertRaises(EngineError) as raised:
+            self.run_engine(fake_run, playable=(True,), sleep=sleep)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.5, 3.0])
+        self.assertNotIn("\x1b", str(raised.exception))
+        self.assertIn("[ERROR 01:01:16] EAI_AGAIN", str(raised.exception))
+        self.assertFalse(list(self.workdir.glob("partial-*.tmp")))
+
+    def test_non_transient_failure_is_not_retried(self):
+        calls = []
+
+        async def fake_run(cmd, cwd):
+            calls.append(cmd)
+            return 1, "authentication failed"
+
+        with self.assertRaisesRegex(EngineError, "authentication failed"):
+            self.run_engine(fake_run, playable=(True,))
+        self.assertEqual(len(calls), 1)
 
     @unittest.skipUnless(shutil.which("dotify"), "dotify is not installed")
     def test_generated_command_is_accepted_by_real_dotify_parser(self):
@@ -1333,7 +1396,15 @@ class TestTokenEngineSignatures(WorkdirCase):
             seen["cmd"] = [str(c) for c in cmd]
             out = Path(cwd) / "Test Artist - Blurred Lines (2013)"
             out.mkdir(parents=True, exist_ok=True)
-            (out / "01. Test Artist - Blurred Lines.flac").write_bytes(b"fLaC\x00\x00")
+            audio_path = out / "01. Test Artist - Blurred Lines.flac"
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "sine=frequency=1000:duration=0.1",
+                    "-c:a", "flac", "-sample_fmt", "s16", str(audio_path),
+                ],
+                check=True,
+            )
             return 0, ""
 
         def record_config(platform, wd):
@@ -1577,7 +1648,7 @@ class TestStreamripConfig(WorkdirCase):
 
 
 class TestDeadMoonProviderHardening(WorkdirCase):
-    def test_tidal_bearer_valid_expiry_and_throttled_download_config(self):
+    def test_tidal_bearer_real_expiry_and_throttled_download_config(self):
         expiry = int(time.time()) + 3600
         self.set_env(
             TIDAL_USER_ID="1", TIDAL_ACCESS_TOKEN="valid-token",
@@ -1589,7 +1660,7 @@ class TestDeadMoonProviderHardening(WorkdirCase):
         self.assertEqual(doc["tidal"]["token_type"], "Bearer")
         self.assertEqual(doc["tidal"]["user_id"], "1")
         self.assertEqual(doc["tidal"]["country_code"], "US")
-        self.assertGreater(int(doc["tidal"]["token_expiry"]), expiry)
+        self.assertEqual(int(doc["tidal"]["token_expiry"]), expiry)
         self.set_env(TIDAL_TOKEN_EXPIRY="1")
         with mock.patch.object(pe.pcfg, "has_tidal_credentials", return_value=True):
             pe._configure_tidal(doc, True)
@@ -1620,6 +1691,78 @@ class TestDeadMoonProviderHardening(WorkdirCase):
             "╭───── Traceback ─────╮", "│ value error │", "worker.py: failed",
         ):
             self.assertIsNone(pe._progress_from_output(line, seen, cwd))
+
+    def test_tidal_aac_result_is_rejected_when_flac_is_enabled(self):
+        workdir = self.stage("tidal/album/aac")
+
+        async def fake_run(cmd, cwd, *args, **kwargs):
+            (Path(cwd) / "01. Lossy.m4a").write_bytes(b"\x00\x00\x00\x18ftypisom")
+            return 0, ""
+
+        with mock.patch.object(pe, "_streamrip_config", return_value=self.root / "config.toml"), mock.patch.object(
+            pe, "_run_subprocess", fake_run
+        ), mock.patch.object(pe, "_sync_refreshed_tidal_tokens"), mock.patch.object(
+            pe.pcfg, "tidal_oauth_fields", return_value={"access_token": "not-a-jwt"}
+        ), mock.patch.object(pe.pcfg, "flac_enabled", return_value=True):
+            with self.assertRaisesRegex(EngineError, "non-FLAC"):
+                asyncio.run(pe.download_via_streamrip(
+                    pcfg.TIDAL, "https://tidal.com/track/1", "track", workdir
+                ))
+
+    def test_streamrip_rc_zero_tidal_auth_failure_is_actionable(self):
+        workdir = self.stage("tidal/album/rejected")
+        with mock.patch.object(pe, "_which", return_value="rip"), mock.patch.object(
+            pe, "_streamrip_config", return_value=self.root / "config.toml"
+        ), mock.patch.object(
+            pe, "_run_subprocess", new=mock.AsyncMock(return_value=(0, "401 Unauthorized"))
+        ), mock.patch.object(
+            pe, "_sync_refreshed_tidal_tokens"
+        ), mock.patch.object(
+            pe.pcfg, "tidal_oauth_fields", return_value={"access_token": "expired"}
+        ):
+            with self.assertRaises(EngineError) as raised:
+                asyncio.run(pe.download_via_streamrip(
+                    pcfg.TIDAL, "https://tidal.com/album/574487091", "album", workdir
+                ))
+        self.assertIn("Tidal API returned HTTP 401/403 Unauthorized", str(raised.exception))
+        self.assertIn("/authenticatetidal", str(raised.exception))
+
+    def test_streamrip_preserves_real_tidal_config_error_without_cid_masking(self):
+        workdir = self.stage("tidal/album/schema")
+        tail = (
+            "Traceback (most recent call last):\n"
+            "TypeError: TidalConfig.__init__() got an unexpected keyword argument 'token_type'"
+        )
+        with mock.patch.object(pe, "_which", return_value="rip"), mock.patch.object(
+            pe, "_streamrip_config", return_value=self.root / "config.toml"
+        ), mock.patch.object(
+            pe, "_run_subprocess", new=mock.AsyncMock(return_value=(1, tail))
+        ), mock.patch.object(
+            pe, "_sync_refreshed_tidal_tokens"
+        ), mock.patch.object(
+            pe.pcfg, "tidal_oauth_fields", return_value={"access_token": "not-a-jwt"}
+        ), mock.patch("builtins.print") as output:
+            with self.assertRaises(EngineError) as raised:
+                asyncio.run(pe.download_via_streamrip(
+                    pcfg.TIDAL, "https://tidal.com/album/574487091", "album", workdir
+                ))
+        self.assertIn("unexpected keyword argument 'token_type'", str(raised.exception))
+        self.assertNotIn("cid=3235", str(raised.exception))
+        self.assertTrue(any("[streamrip] tidal rc=1 output:" in str(call) for call in output.call_args_list))
+
+    def test_streamrip_rc_zero_reports_last_nonempty_output_line(self):
+        workdir = self.stage("qobuz/album/empty")
+        with mock.patch.object(pe, "_which", return_value="rip"), mock.patch.object(
+            pe, "_streamrip_config", return_value=self.root / "config.toml"
+        ), mock.patch.object(
+            pe, "_run_subprocess",
+            new=mock.AsyncMock(return_value=(0, "first detail\n\nlast useful error\n")),
+        ):
+            with self.assertRaises(EngineError) as raised:
+                asyncio.run(pe.download_via_streamrip(
+                    pcfg.QOBUZ, "https://open.qobuz.com/album/1", "album", workdir
+                ))
+        self.assertIn("last useful error", str(raised.exception))
 
     def test_refreshed_tidal_token_is_synced_to_private_toml(self):
         import tomlkit

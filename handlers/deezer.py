@@ -34,7 +34,8 @@ from dl_utils.deezer_download import (
     get_song_infos_from_deezer_website,
     init_deezer_session,
 )
-from dl_utils.deezer_utils import clean_filename
+from dl_utils.deezer_utils import clean_filename, download_cover
+from dl_utils.metadata_bridge import upgrade_cover_url
 from utils import (
     TMP_DIR,
     __,
@@ -541,9 +542,7 @@ def get_track_metadata_from_api(track_id):
         )
 
         # Fetch cover image data
-        cover_response = requests.get(cover_url, stream=True)
-        cover_response.raise_for_status()
-        cover_data = cover_response.content  # Read content directly
+        cover_data = download_cover(upgrade_cover_url(cover_url))
 
         # Extract other metadata
         artists = [
@@ -642,9 +641,7 @@ def get_album_metadata_from_api(album_id):
         )
 
         # Fetch cover image data
-        cover_response = requests.get(cover_url, stream=True)
-        cover_response.raise_for_status()
-        cover_data = cover_response.content
+        cover_data = download_cover(upgrade_cover_url(cover_url))
 
         # Extract album metadata
         release_date_str = album_json.get("release_date", "0000-00-00")
@@ -974,11 +971,7 @@ async def handle_track_link(event: types.Message, real_link=None):
                 summarize_track_issues([dl_track_info])[0][0]
             )
 
-        # Send based on format preference
-        if pcfg.output_format() == "zip":
-            await create_and_send_zip(event, metadata, [dl_track_info], is_album=False)
-        else:
-            await send_track_audio(event, metadata, dl_track_info)
+        await create_and_send_zip(event, metadata, [dl_track_info], is_album=False)
 
         await _safe_delete(tmp_msg)
         # Delete the original user message after successful processing
@@ -1088,11 +1081,7 @@ async def handle_album_link(event: types.Message, real_link=None):
             else ""
         )
 
-        # Send based on format preference
-        if pcfg.output_format() == "zip":
-            await create_and_send_zip(event, metadata, dl_tracks_info, is_album=True)
-        else:
-            await send_album_audio(event, metadata, dl_tracks_info)
+        await create_and_send_zip(event, metadata, dl_tracks_info, is_album=True)
 
         await _safe_delete(tmp_msg)
         # Delete the original user message after successful processing

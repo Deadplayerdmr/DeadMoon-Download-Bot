@@ -40,6 +40,7 @@ import time
 import traceback
 from io import BytesIO
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -51,7 +52,7 @@ from unidecode import unidecode
 
 from dl_utils import platform_config
 from dl_utils.deezer_utils import clean_filename, get_audio_duration
-from utils import TMP_DIR, __, get_bool_env
+from utils import TMP_DIR, __
 
 # Telegram caps a bot's file upload at 50 MB; 48 MB leaves room for the
 # container overhead that pushes an exactly-50 MB archive over the limit.
@@ -97,14 +98,112 @@ def format_file_size(num_bytes: int) -> str:
     return f"{size:.1f} TB"
 
 
-def _audio_caption(metadata, kind: str, size: int, source: str = "") -> str:
+def prepare_cover_bytes(cover_data: Optional[bytes]) -> Optional[bytes]:
+    """Keep full-resolution artwork within Telegram's photo limits."""
+    if not cover_data or not isinstance(cover_data, (bytes, bytearray)):
+        return None
+    data = bytes(cover_data)
+    try:
+        image = Image.open(BytesIO(data))
+        image.load()
+        if max(image.size) > 2560:
+            image.thumbnail((2560, 2560))
+        image = image.convert("RGB")
+        output = BytesIO()
+        for quality in (92, 85, 75, 65):
+            output.seek(0)
+            output.truncate()
+            image.save(output, format="JPEG", quality=quality)
+            if output.tell() <= 9_500_000:
+                return output.getvalue()
+        while max(image.size) > 320:
+            image.thumbnail((int(image.width * 0.8), int(image.height * 0.8)))
+            output.seek(0)
+            output.truncate()
+            image.save(output, format="JPEG", quality=65)
+            if output.tell() <= 9_500_000:
+                return output.getvalue()
+        return None
+    except Exception:
+        # Some provider fixtures contain a JPEG signature but truncated data.
+        return data if data.startswith((b"\xff\xd8\xff", b"\xff\xd8")) else None
+
+
+_prepare_cover_bytes = prepare_cover_bytes
+
+
+def _meta_dict(metadata) -> dict:
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    return {
+        key: getattr(metadata, key)
+        for key in (
+            "title", "artist", "album_title", "year", "release_date",
+            "clean_artist", "clean_album_title", "clean_title", "cover_data",
+            "album_link", "track_link", "artists_list", "tracks_api_data",
+            "source_label", "quality_label", "caption_suffix",
+        )
+        if hasattr(metadata, key)
+    }
+
+
+def _valid_artist(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("title")
+    artist = str(value or "").strip()
+    return "" if artist.casefold() in ("", "unknown artist") else artist
+
+
+def _metadata_with_track_artist(metadata, tracks) -> dict:
+    resolved = _meta_dict(metadata)
+
+    def track_artist(track):
+        return _valid_artist(track.get("artist_name")) or _valid_artist(
+            track.get("ART_NAME")
+        ) or _valid_artist(track.get("artist"))
+
+    if not _valid_artist(resolved.get("artist")):
+        artist = next(
+            (artist for track in tracks or [] if (artist := track_artist(track))),
+            "",
+        )
+        if artist:
+            resolved["artist"] = artist
+            resolved["clean_artist"] = clean_filename(artist)
+            resolved["artists_list"] = [artist]
+    resolved.setdefault("artist", "Unknown Artist")
+    return resolved
+
+
+def _track_extension(track: dict) -> str:
+    extension = str(track.get("file_extension") or "").strip().lower()
+    if not extension:
+        extension = Path(str(track.get("song_path") or "")).suffix.lower()
+    return f".{extension.lstrip('.')}" if extension else ""
+
+
+def _track_metadata(metadata, track: dict) -> dict:
+    track_meta = _meta_dict(metadata)
+    track_meta["title"] = str(
+        track.get("song_name") or track.get("title") or track.get("SNG_TITLE")
+        or track_meta.get("title") or "Unknown Track"
+    ).strip()
+    track_artist = _valid_artist(track.get("artist_name")) or _valid_artist(
+        track.get("ART_NAME")
+    ) or _valid_artist(track.get("artist")) or _valid_artist(track_meta.get("artist"))
+    track_meta["artist"] = track_artist or "Unknown Artist"
+    return track_meta
+
+
+def _audio_caption(metadata, kind: str, size: int, source: str = "", extension: str = "") -> str:
     get = metadata.get if isinstance(metadata, dict) else lambda key, default="": getattr(metadata, key, default)
-    title = get("album_title") or get("title", "")
-    artist = get("artist", "") or "Unknown Artist"
+    title = get("title") if kind == "Track" else get("album_title") or get("title", "")
+    artist = _valid_artist(get("artist", "")) or "Unknown Artist"
     heading = f"<b>{kind}: {html.escape(str(title))}</b>"
+    suffix = f" ({extension})" if extension else ""
     caption = (
         f"🌙 {heading}\n🎧 {html.escape(str(artist))}\n"
-        f"📦 <b>Size:</b> {format_file_size(size)}"
+        f"📦 <b>Size:</b> {format_file_size(size)}{suffix}"
     )
     if source:
         caption += f"\nSource: {html.escape(str(source))}"
@@ -150,20 +249,15 @@ def _thumbnail(cover_data):
 async def send_track_audio(event, metadata, track):
     """Upload one original-format audio attachment without recompression."""
     path = Path(track["song_path"])
-    get = metadata.get if isinstance(metadata, dict) else lambda key, default="": getattr(metadata, key, default)
-    title = track.get("song_name") or get("title", "") or path.stem
-    artist = track.get("artist_name") or get("artist", "")
-    caption = _audio_caption(metadata, "Track", path.stat().st_size)
-    cover = metadata.get("cover_data") if isinstance(metadata, dict) else getattr(metadata, "cover_data", None)
-    try:
-        caption += f"\n🎵 {html.escape(str(title))}"
-    except (TypeError, ValueError):
-        pass
+    track_meta = _track_metadata(_metadata_with_track_artist(metadata, [track]), track)
+    caption = _audio_caption(
+        track_meta, "Track", path.stat().st_size, extension=_track_extension(track)
+    )
     audio = await event.answer_audio(
         FSInputFile(path),
-        title=str(title), performer=str(artist),
-        thumbnail=_thumbnail(make_audio_thumbnail(cover)),
-        duration=_audio_duration(metadata, track, path),
+        title=track_meta["title"], performer=track_meta["artist"],
+        thumbnail=_thumbnail(make_audio_thumbnail(track_meta.get("cover_data"))),
+        duration=_audio_duration(track_meta, track, path),
         caption=caption, parse_mode="HTML",
     )
     if audio:
@@ -173,13 +267,28 @@ async def send_track_audio(event, metadata, track):
 
 async def send_album_audio(event, metadata, dl_tracks_info):
     """Send an album header followed by tracks in their original formats."""
+    metadata = _metadata_with_track_artist(metadata, dl_tracks_info)
     size = sum(Path(track["song_path"]).stat().st_size for track in dl_tracks_info)
-    caption = _audio_caption(metadata, "Album", size)
-    cover = metadata.get("cover_data") if isinstance(metadata, dict) else getattr(metadata, "cover_data", None)
-    if cover and get_bool_env("SEND_ALBUM_COVER", True):
-        header = await event.answer_photo(
-            BufferedInputFile(prepare_cover_bytes(cover), filename="cover.jpg"), caption=caption, parse_mode="HTML"
-        )
+    extensions = ", ".join(dict.fromkeys(
+        extension for track in dl_tracks_info
+        if (extension := _track_extension(track))
+    ))
+    caption = _audio_caption(metadata, "Album", size, extension=extensions)
+    cover = metadata.get("cover_data")
+    if cover and platform_config.send_album_cover():
+        prepared_cover = prepare_cover_bytes(cover)
+    else:
+        prepared_cover = None
+    if prepared_cover:
+        try:
+            header = await event.answer_photo(
+                BufferedInputFile(prepared_cover, filename="cover.jpg"),
+                caption=caption,
+                parse_mode="HTML",
+            )
+        except Exception as error:
+            print(f"Error sending album cover: {error}")
+            header = await event.answer(caption, parse_mode="HTML")
     else:
         header = await event.answer(caption, parse_mode="HTML")
     messages = [header] if header else []
@@ -671,17 +780,24 @@ async def deliver_zip(
     server_files_to_delete = []
     auto_delete_seconds = platform_config.auto_delete_seconds()
 
-    if cover_data:
-        try:
-            cover_msg = await event.answer_photo(
-                BufferedInputFile(cover_data, filename="cover.jpg"),
-                caption=caption,
-                parse_mode="HTML",
-            )
-            sent_messages.append(cover_msg)
-        except Exception as photo_e:
-            print(f"Error sending cover photo: {photo_e}")
-            await event.answer(f"⚠️ Could not send cover image.\n{caption}", parse_mode="HTML")
+    caption_sent = False
+    if cover_data and platform_config.send_album_cover():
+        prepared_cover = prepare_cover_bytes(cover_data)
+        if prepared_cover:
+            try:
+                cover_msg = await event.answer_photo(
+                    BufferedInputFile(prepared_cover, filename="cover.jpg"),
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+                sent_messages.append(cover_msg)
+                caption_sent = True
+            except Exception as photo_e:
+                print(f"Error sending cover photo: {photo_e}")
+    if not caption_sent and caption:
+        caption_msg = await event.answer(caption, parse_mode="HTML")
+        sent_messages.append(caption_msg)
+        caption_sent = True
 
     if not files_to_zip:
         print("No valid files found to add to the zip archive.")
@@ -787,7 +903,7 @@ async def deliver_zip(
                     )
                     doc_msg = await event.answer_document(
                         FSInputFile(zip_file),
-                        caption=part_caption,
+                        caption=f"{caption}\n{part_caption}" if not caption_sent else part_caption,
                         parse_mode="HTML",
                         disable_notification=True,
                     )
@@ -828,11 +944,15 @@ def release_zip_names(metadata, is_album: bool) -> tuple[str, str]:
 async def create_and_send_zip(
     event: types.Message, metadata, dl_tracks_info, is_album: bool
 ):
-    """Deliver native audio or build an archive for one release."""
-    if platform_config.output_format() != "zip":
+    """Send native audio only in unhosted audio mode; otherwise deliver a ZIP."""
+    metadata = _metadata_with_track_artist(metadata, dl_tracks_info)
+    audio_only = (
+        platform_config.output_format() != "zip"
+        and not platform_config.copy_files_path()
+    )
+    if audio_only:
         if not is_album and len(dl_tracks_info) == 1:
-            track = dl_tracks_info[0]
-            audio = await send_track_audio(event, metadata, track)
+            audio = await send_track_audio(event, metadata, dl_tracks_info[0])
             return [audio] if audio else []
         return await send_album_audio(event, metadata, dl_tracks_info)
     user_id, username, first_name = get_user_infos(event)
@@ -862,7 +982,11 @@ async def create_and_send_artist_zip(
     tuples. Every release keeps the usual per-release layout in archive mode;
     audio mode sends each release header followed by its original tracks.
     """
-    if platform_config.output_format() != "zip":
+    audio_only = (
+        platform_config.output_format() != "zip"
+        and not platform_config.copy_files_path()
+    )
+    if audio_only:
         total = sum(
             Path(track["song_path"]).stat().st_size
             for _, _, tracks in downloaded_releases for track in tracks
