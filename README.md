@@ -441,12 +441,3 @@ so a green run with unexpected skips means the environment was not what you assu
 
 Licensed under the GNU General Public License v3.0 — see [LICENSE](LICENSE). Because this
 bot is built on GPL upstreams, modifications must be distributed under the same terms.
-
-
-## Private deployment and public release archives
-
-`deploy.zip` is a private production bundle and may contain `token.env`, populated
-`local_resources/`, and `data/whitelist.json`. Protect it like a credential database.
-`githubready.zip` is staged separately for publication: it omits the live environment,
-whitelist and real credential resources, while retaining placeholders and examples. Never
-sanitize the live working tree to create a public archive.
