@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -111,10 +112,10 @@ class TestTelegramCommands(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Group_* &lt;Listeners &amp; Friends&gt;", text)
         self.assertNotIn("User_* <Admin & Co>", text)
 
-    async def test_newarl_reload_error_escapes_exception_text(self):
+    async def test_authenticatedeezer_reload_error_escapes_exception_text(self):
         with isolated_main() as (main, namespace):
             class Event:
-                text = "/newarl " + "x" * 50
+                text = "/authenticatedeezer " + "x" * 50
 
                 async def reply(self, text, **kwargs):
                     self.reply_text = text
@@ -125,11 +126,38 @@ class TestTelegramCommands(unittest.IsolatedAsyncioTestCase):
                 main, "refresh_deezer_session",
                 new=mock.AsyncMock(side_effect=RuntimeError("reload_* <failed & unsafe>")),
             ):
-                await main.update_arl(event)
+                await main.authenticate_deezer(event)
 
         self.assertEqual(event.reply_kwargs["parse_mode"], "HTML")
         self.assertIn("<code>reload_* &lt;failed &amp; unsafe&gt;</code>", event.reply_text)
         self.assertNotIn("reload_* <failed & unsafe>", event.reply_text)
+
+    async def test_legacy_arl_commands_are_not_registered(self):
+        with isolated_main() as (main, _):
+            bot = mock.Mock()
+            bot.set_my_commands = mock.AsyncMock()
+            await main.set_admin_commands(bot)
+            menu = {
+                command.command
+                for call in bot.set_my_commands.await_args_list
+                for command in call.kwargs["commands"]
+            }
+            self.assertIn("authenticatedeezer", menu)
+            self.assertFalse({"arl", "newarl"} & menu)
+            self.assertFalse(hasattr(main, "show_arl"))
+            self.assertFalse(hasattr(main, "update_arl"))
+
+            legacy_handlers = []
+            for handler in main.dp.message.handlers:
+                if handler.callback in (getattr(main, "show_arl", None), getattr(main, "update_arl", None)):
+                    legacy_handlers.append(handler)
+                    continue
+                for filter_ in handler.filters:
+                    callback = getattr(filter_, "callback", None)
+                    commands = getattr(callback, "commands", ()) if callback else ()
+                    if commands and {"arl", "newarl"} & set(commands):
+                        legacy_handlers.append(handler)
+            self.assertEqual(legacy_handlers, [])
 
     async def test_status_handler_replies_with_html(self):
         with isolated_main() as (main, _):
@@ -350,6 +378,243 @@ class TestQobuzMetadata(ProductionCase):
         self.assertEqual(info.release_date, "2020-10-20")
         self.assertEqual(info.cover_url, "https://static.qobuz.com/large.jpg")
 
+    def test_qobuz_api_identity_precedes_conflicting_odesli_metadata(self):
+        direct_info = mb.ReleaseInfo(
+            platform=pcfg.QOBUZ, kind="album", object_id="gz6zuz3ypmamc",
+            artist="Fred V & Grafix", album_title="Recognise", year="2014",
+            album_link="https://open.qobuz.com/album/gz6zuz3ypmamc",
+            source="qobuz-api",
+        )
+
+        async def no_siblings(url, *, params=None, headers=None):
+            return None
+
+        odesli_info = mb.ReleaseInfo(
+            platform=pcfg.QOBUZ, kind="album", object_id="gz6zuz3ypmamc",
+            artist="FRESCEN PHANOR", album_title="Winer Christmas",
+            album_link="https://music.apple.com/us/album/spam/1754153655",
+            source="itunes-search",
+            siblings={"apple": "https://music.apple.com/us/album/spam/1754153655"},
+        )
+
+        async def odesli(url, kind, object_id, platform):
+            return odesli_info
+
+        with mock.patch.object(mb, "_from_odesli", side_effect=odesli), mock.patch.object(
+            mb, "qobuz_public", new=mock.AsyncMock(return_value=direct_info)
+        ) as direct, mock.patch.object(mb, "_fetch_json", side_effect=no_siblings), mock.patch.object(
+            mb, "_attach_cover", new=mock.AsyncMock()
+        ):
+            info = asyncio.run(mb.release_info(
+                pcfg.QOBUZ, "album", "gz6zuz3ypmamc",
+                url="https://play.qobuz.com/album/gz6zuz3ypmamc",
+            ))
+        self.assertIs(info, direct_info)
+        self.assertEqual(info.artist, "Fred V & Grafix")
+        self.assertEqual(info.album_title, "Recognise")
+        self.assertEqual(info.year, "2014")
+        direct.assert_awaited_once_with("album", "gz6zuz3ypmamc")
+
+    def test_generic_platform_titles_are_rejected_for_html_and_json_ld(self):
+        for name in (
+            "Qobuz", "Play Qobuz", "Open Qobuz", "Tidal", "Spotify",
+            "Apple Music", "Deezer", "SoundCloud", "Amazon Music",
+        ):
+            with self.subTest(name=name):
+                async def generic_page(url, *, params=None, headers=None):
+                    return f'<title>{name}</title><script type="application/ld+json">{{"@type":"MusicAlbum","name":"{name}","byArtist":{{"name":"{name}"}}}}</script>'
+
+                with mock.patch.object(mb, "_fetch_text", side_effect=generic_page):
+                    info = asyncio.run(mb.page_metadata(
+                        "https://example.test/album/rawid123", pcfg.QOBUZ, "album", "rawid123"
+                    ))
+                self.assertIsNone(info)
+                self.assertEqual(mb._search_metadata_hint(None, "album", "https://open.qobuz.com/album/rawid123"), "")
+
+    def test_qobuz_api_uses_configured_authentication(self):
+        fields = {
+            "app_id": "configured-app-id",
+            "password_or_token": "configured-user-token",
+            "use_auth_token": True,
+        }
+
+        async def fetch(url, *, params=None, headers=None):
+            self.assertEqual(url, f"{mb._QOBUZ_API}/album/get")
+            self.assertEqual(params, {"album_id": "123456", "app_id": "configured-app-id"})
+            self.assertEqual(headers, {
+                "X-App-Id": "configured-app-id",
+                "X-User-Auth-Token": "configured-user-token",
+            })
+            return {
+                "id": 123456,
+                "title": "Recognise",
+                "release_date_original": "2014-06-02",
+                "artist": {"name": "Fred V & Grafix"},
+            }
+
+        with mock.patch.object(mb.pcfg, "qobuz_fields", return_value=fields), mock.patch.object(
+            mb, "_fetch_json", side_effect=fetch
+        ):
+            info = asyncio.run(mb.qobuz_public("album", "123456"))
+        self.assertEqual(info.album_title, "Recognise")
+        self.assertEqual(info.artist, "Fred V & Grafix")
+        self.assertEqual(info.album_link, "https://open.qobuz.com/album/123456")
+
+    def test_generic_qobuz_shell_never_searches_itunes_or_returns_spam(self):
+        spam_url = "https://music.apple.com/us/album/winer-christmas-and-holiday-season-dj-viral-qobuz-i/1754153655?uo=4"
+        spam_title = "Winer Christmas and Holiday season / DJ Viral / Qobuz / I tune / 7 Digital / Tik tok / Youtube / (Special Version) - Single"
+        spam = mb.ReleaseInfo(
+            platform=pcfg.APPLE,
+            artist="FRESCEN PHANOR",
+            album_title=spam_title,
+            album_link=spam_url,
+            source="itunes-search",
+        )
+
+        for object_id in ("gz6zuz3ypmamc", "jnhnqku4red9b"):
+            with self.subTest(object_id=object_id):
+                requested = f"https://play.qobuz.com/album/{object_id}"
+                link = st.parse_link(requested)
+                self.assertEqual(link.url, f"https://open.qobuz.com/album/{object_id}")
+
+                async def no_odesli(url):
+                    return None
+
+                async def empty_json(url, *, params=None, headers=None):
+                    self.assertNotEqual(url, mb._ITUNES_SEARCH)
+                    return None
+
+                async def generic_page(url, *, params=None, headers=None):
+                    return "<html><head><title>Qobuz</title><meta property=\"og:title\" content=\"Qobuz\"></head></html>"
+
+                async def poisoned_search(*args, **kwargs):
+                    self.fail("a generic Qobuz shell must not trigger a blind iTunes search")
+
+                with mock.patch.object(mb, "odesli_links", no_odesli), mock.patch.object(
+                    mb, "_fetch_json", side_effect=empty_json
+                ), mock.patch.object(mb, "_fetch_text", side_effect=generic_page), mock.patch.object(
+                    mb, "itunes_search", side_effect=poisoned_search
+                ):
+                    info = asyncio.run(mb.release_info(
+                        link.platform, link.kind, link.object_id, url=link.original_url
+                    ))
+                self.assertIsNone(info)
+                self.assertNotIn("FRESCEN PHANOR", str(info))
+                self.assertNotIn(spam_url, str(info))
+
+                engine = pe.ReleaseMetadata(
+                    artist="Verified Artist",
+                    title="Verified Album",
+                    album_title="Verified Album",
+                    year="2020",
+                    source_label="Qobuz (Direct · streamrip)",
+                    album_link=link.url,
+                )
+                merged = mb.merge_info(engine, spam)
+                self.assertEqual(merged["artist"], "Verified Artist")
+                self.assertEqual(merged["album_title"], "Verified Album")
+                self.assertEqual(merged["album_link"], link.url)
+                self.assertNotEqual(merged["album_link"], spam_url)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for real FLAC tags")
+    def test_downloaded_flac_tags_win_and_name_release_archives(self):
+        import hashlib
+        from dl_utils.archive_delivery import hashed_archive_basename, release_zip_names
+
+        cases = (
+            (
+                "gz6zuz3ypmamc", "Fred V & Grafix", "Recognise", "2014", "Hydra",
+                "Fred V & Grafix - Recognise (2014)/01. Fred V & Grafix - Hydra.flac",
+                "Fred_V_&_Grafix_-_Recognise_",
+            ),
+            (
+                "jnhnqku4red9b", "Mefjus, Camo & Krooked", "Sientelo", "2021", "Sientelo",
+                "Mefjus, Camo & Krooked - Sientelo (2021)/01. Mefjus - Sientelo.flac",
+                "Mefjus,_Camo_&_Krooked_-_Sientelo_",
+            ),
+        )
+        spam = mb.ReleaseInfo(
+            platform=pcfg.APPLE,
+            artist="FRESCEN PHANOR",
+            album_title="Winer Christmas and Holiday season / Qobuz - Single",
+            year="2024",
+            release_date="2024-06-24",
+            album_link="https://music.apple.com/us/album/winer-christmas/1754153655?uo=4",
+            source="itunes-search",
+        )
+        for object_id, artist, album, year, song, relative, zip_prefix in cases:
+            with self.subTest(object_id=object_id):
+                workdir = self.root / object_id
+                audio_path = workdir / relative
+                audio_path.parent.mkdir(parents=True)
+                subprocess.run([
+                    "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "anullsrc=r=44100:cl=stereo", "-t", "0.05", "-c:a", "flac",
+                    "-metadata", f"album={album}", "-metadata", f"albumartist={artist}",
+                    "-metadata", f"artist={artist}", "-metadata", f"title={song}",
+                    "-metadata", f"date={year}", "-metadata", "tracknumber=1",
+                    str(audio_path), "-y",
+                ], check=True, capture_output=True)
+
+                audio, release_dir, _ = pe.discover_release(workdir)
+                inferred = pe.infer_release_from_paths(audio, workdir=workdir)
+                self.assertEqual(inferred, (artist, album, year))
+                result = pe._result_from_workdir(
+                    pcfg.QOBUZ, "direct", "streamrip",
+                    f"https://open.qobuz.com/album/{object_id}", "album", workdir,
+                )
+                self.assertEqual(result.tracks[0]["song_name"], song)
+                self.assertEqual(result.tracks[0]["artist_name"], artist)
+                self.assertEqual(result.tracks[0]["TRACK_NUMBER"], "1")
+                merged = mb.merge_info(result.metadata, spam)
+                self.assertEqual(merged["artist"], artist)
+                self.assertEqual(merged["album_title"], album)
+                self.assertEqual(merged["title"], album)
+                self.assertEqual(merged["year"], year)
+                self.assertEqual(merged["release_date"], year)
+                self.assertEqual(merged["album_link"], f"https://open.qobuz.com/album/{object_id}")
+
+                hash_title, copy_name = release_zip_names(merged, True)
+                archive_name = hashed_archive_basename(hash_title, copy_name) + ".zip"
+                expected_hash = hashlib.md5(hash_title.encode()).hexdigest()[:8]
+                self.assertEqual(archive_name, f"{zip_prefix}({expected_hash}).zip")
+                self.assertRegex(archive_name, rf"^{__import__('re').escape(zip_prefix)}\([0-9a-f]{{8}}\)\.zip$")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for real audio tags")
+    def test_m4a_and_mp3_tags_enrich_release_and_track_metadata(self):
+        for extension, codec in (("m4a", "aac"), ("mp3", "libmp3lame")):
+            with self.subTest(extension=extension):
+                workdir = self.root / f"tagged-{extension}"
+                release_dir = workdir / "Wrong Folder Name"
+                release_dir.mkdir(parents=True)
+                path = release_dir / f"07. Wrong Artist - Wrong Title.{extension}"
+                subprocess.run([
+                    "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "anullsrc=r=44100:cl=stereo", "-t", "0.05", "-c:a", codec,
+                    "-metadata", "album=Tagged Album", "-metadata", "albumartist=Tagged Album Artist",
+                    "-metadata", "artist=Tagged Track Artist", "-metadata", "title=Tagged Song",
+                    "-metadata", "date=2022-03-04", "-metadata", "tracknumber=7/12",
+                    str(path), "-y",
+                ], check=True, capture_output=True)
+                if extension == "m4a":
+                    from mutagen.mp4 import MP4
+                    tagged = MP4(path)
+                    tagged["aART"] = ["Tagged Album Artist"]
+                    tagged["trkn"] = [(7, 12)]
+                    tagged.save()
+                result = pe._result_from_workdir(
+                    pcfg.QOBUZ, "direct", "streamrip",
+                    "https://play.qobuz.com/album/numeric123", "album", workdir,
+                )
+                self.assertEqual(result.metadata.artist, "Tagged Album Artist")
+                self.assertEqual(result.metadata.album_title, "Tagged Album")
+                self.assertEqual(result.metadata.year, "2022")
+                self.assertEqual(result.metadata.release_date, "2022-03-04")
+                self.assertEqual(result.tracks[0]["artist_name"], "Tagged Track Artist")
+                self.assertEqual(result.tracks[0]["song_name"], "Tagged Song")
+                self.assertEqual(result.tracks[0]["TRACK_NUMBER"], "7")
+                self.assertEqual(result.metadata.album_link, "https://open.qobuz.com/album/numeric123")
+
 
 class TestMetadataLabelMerging(unittest.TestCase):
     @staticmethod
@@ -414,12 +679,12 @@ class TestMetadataLabelMerging(unittest.TestCase):
             platform=pcfg.APPLE,
             kind="album",
             object_id="123",
-            artist="Canonical Artist",
-            album_title="Canonical Album",
+            artist="Engine Artist",
+            album_title="Engine Album",
         )
         merged = mb.merge_info(engine, bridge)
-        self.assertEqual(merged["artist"], "Canonical Artist")
-        self.assertEqual(merged["album_title"], "Canonical Album")
+        self.assertEqual(merged["artist"], "Engine Artist")
+        self.assertEqual(merged["album_title"], "Engine Album")
         self.assertEqual(merged["source_label"], "Apple Music (Direct · gamdl)")
         self.assertEqual(merged["quality_label"], "FLAC 24-bit/96 kHz")
 
@@ -535,6 +800,26 @@ class TestDeezerFallback(ProductionCase):
         ):
             matched, _ = asyncio.run(pe._deezer_match(url, "album"))
         self.assertEqual(matched, "https://www.deezer.com/album/903788892")
+
+    def test_deezer_fallback_never_searches_generic_or_raw_qobuz_ids(self):
+        for object_id in ("gz6zuz3ypmamc", "123456789"):
+            with self.subTest(object_id=object_id):
+                async def no_odesli(url):
+                    return None
+
+                async def no_release_info(*args, **kwargs):
+                    return None
+
+                async def forbidden_search(url, *, params=None, headers=None):
+                    self.fail("fallback search must not use a raw Qobuz ID or platform name")
+
+                with mock.patch.object(mb, "odesli_links", no_odesli), mock.patch.object(
+                    mb, "release_info", side_effect=no_release_info
+                ), mock.patch.object(mb, "_fetch_json", side_effect=forbidden_search):
+                    matched = asyncio.run(pe._search_deezer_url(
+                        f"https://play.qobuz.com/album/{object_id}", "album"
+                    ))
+                self.assertEqual(matched, "")
 
     def test_direct_song_link_match_is_used_before_search(self):
         async def odesli(url):

@@ -277,6 +277,109 @@ def find_audio(root: Path) -> list[Path]:
 
 
 _DISC_DIR = re.compile(r"^(?:disc|cd|disk)\s*\d+$", re.I)
+_AUDIO_TAG_CACHE: dict[tuple[str, int, int], dict] = {}
+
+
+def _first_tag(tags, *keys) -> str:
+    if not tags:
+        return ""
+    for key in keys:
+        try:
+            value = tags.get(key)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else ""
+        if not isinstance(value, str):
+            value = getattr(value, "text", value)
+            if isinstance(value, (list, tuple)):
+                value = value[0] if value else ""
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _audio_tags(path: Path) -> dict:
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if cache_key in _AUDIO_TAG_CACHE:
+        return dict(_AUDIO_TAG_CACHE[cache_key])
+    if path.suffix.lower() not in {".flac", ".m4a", ".mp3"}:
+        return {}
+
+    try:
+        import mutagen
+
+        tagged = mutagen.File(str(path), easy=False)
+    except Exception:
+        tagged = None
+    if tagged is None:
+        return {}
+    tags = getattr(tagged, "tags", None)
+    values = {
+        "album": _first_tag(tags, "album", "TALB", "\xa9alb"),
+        "albumartist": _first_tag(
+            tags, "albumartist", "album artist", "TPE2", "TXXX:albumartist",
+            "TXXX:album artist", "TXXX:ALBUMARTIST", "aART",
+        ),
+        "artist": _first_tag(tags, "artist", "TPE1", "\xa9ART"),
+        "title": _first_tag(tags, "title", "TIT2", "TXXX:title", "\xa9nam"),
+        "date": _first_tag(
+            tags, "date", "year", "originaldate", "TDRC", "TDOR", "TYER",
+            "TXXX:date", "TXXX:year", "\xa9day",
+        ),
+        "tracknumber": _first_tag(
+            tags, "tracknumber", "track", "TRCK", "TXXX:tracknumber", "trkn",
+        ),
+        "discnumber": _first_tag(
+            tags, "discnumber", "disc", "TPOS", "TXXX:discnumber", "disk",
+        ),
+    }
+    if not values["date"] and tags is not None:
+        try:
+            timestamp = tags.get("TDRL")
+            values["date"] = str(timestamp.text[0]) if timestamp and timestamp.text else ""
+        except (AttributeError, IndexError, TypeError):
+            pass
+    if len(_AUDIO_TAG_CACHE) >= 2048:
+        _AUDIO_TAG_CACHE.clear()
+    _AUDIO_TAG_CACHE[cache_key] = values
+    return dict(values)
+
+
+def _tag_number(value: str) -> str:
+    return value.split("/", 1)[0].strip()
+
+
+def _tag_year(value: str) -> str:
+    match = re.search(r"(?:19|20)\d{2}", value or "")
+    return match.group() if match else ""
+
+
+def _release_tag_metadata(audio: list[Path]) -> tuple[str, str, str, str]:
+    from collections import Counter
+
+    tagged = [_audio_tags(path) for path in audio]
+
+    def common(key: str, *fallback_keys: str) -> str:
+        for field in (key, *fallback_keys):
+            names = [tags[field].strip() for tags in tagged if tags.get(field, "").strip()]
+            if not names:
+                continue
+            counts = Counter(name.casefold() for name in names)
+            winner, count = counts.most_common(1)[0]
+            if count == len(audio):
+                return next(name for name in names if name.casefold() == winner)
+        return ""
+
+    artist = common("albumartist", "artist")
+    album = common("album")
+    date = common("date")
+    return artist, album, _tag_year(date), date
 
 
 def discover_release(workdir: Path) -> tuple[list[Path], Path | None, str | None]:
@@ -425,10 +528,11 @@ def infer_release_from_paths(
     if artist and album.lower().startswith(artist.lower() + " -"):
         album = album[len(artist) + 1 :].strip(" -·")
 
+    tag_artist, tag_album, tag_year, _ = _release_tag_metadata(audio)
     return (
-        artist or "Unknown Artist",
-        album or "Unknown Album",
-        year,
+        tag_artist or artist or "Unknown Artist",
+        tag_album or album or "Unknown Album",
+        tag_year or year,
     )
 
 
@@ -443,10 +547,18 @@ def _track_number_from_name(name: str) -> int | None:
 def tracks_from_paths(audio: list[Path], release_dir: Path, artist_fallback: str = "") -> list:
     parsed = []
     for index, path in enumerate(audio, start=1):
+        tags = _audio_tags(path)
         disc, number, rest = _track_prefix(path.stem)
+        tag_disc = _tag_number(tags.get("discnumber", ""))
+        if tag_disc.isdigit():
+            disc = int(tag_disc)
         if disc is None and _DISC_DIR.fullmatch(path.parent.name):
             disc = int(re.search(r"\d+", path.parent.name).group())
         number, artist_name, title = _split_track_rest(number, rest, path.stem)
+        tag_number = _tag_number(tags.get("tracknumber", ""))
+        number = tag_number or number
+        artist_name = tags.get("artist") or tags.get("albumartist") or artist_name
+        title = tags.get("title") or title
         parsed.append([index, disc, number, artist_name, title, path])
 
     multi_disc = len({disc for _, disc, *_ in parsed if disc is not None}) > 1
@@ -537,19 +649,25 @@ def _result_from_workdir(
         raise EngineError(f"{provider} produced no audio files for {url}")
 
     artist, album, year = infer_release_from_paths(audio, workdir=workdir)
+    tracks = tracks_from_paths(audio, release_dir, artist_fallback=artist)
+    _, _, _, release_date = _release_tag_metadata(audio)
+    canonical_url = url
+    if platform == pcfg.QOBUZ:
+        source = classify(url)
+        if source:
+            canonical_url = source.url
     metadata = ReleaseMetadata(
         artist=artist,
-        title=album,
+        title=tracks[0]["song_name"] if kind == KIND_TRACK and len(tracks) == 1 else album,
         album_title=album,
         year=year,
-        release_date=year,
+        release_date=release_date or year,
         kind=kind,
-        album_link="" if kind == KIND_TRACK else url,
-        track_link=url if kind == KIND_TRACK else "",
+        album_link="" if kind == KIND_TRACK else canonical_url,
+        track_link=canonical_url if kind == KIND_TRACK else "",
         cover_data=read_cover(cover_path),
         artists_list=[artist],
     )
-    tracks = tracks_from_paths(audio, release_dir, artist_fallback=artist)
     metadata.source_label = _source_label(platform, mode, provider)
     metadata.quality_label = _quality_label(tracks)
     return EngineResult(
@@ -588,12 +706,6 @@ def _matching_deezer_url(candidate: str, kind: str) -> str:
     return ""
 
 
-def _search_title(info) -> str:
-    if not info:
-        return ""
-    return info.title if info.kind == KIND_TRACK else info.album_title
-
-
 async def _search_deezer_url(url: str, kind: str) -> str:
     source = classify(url)
     if source is None:
@@ -620,13 +732,9 @@ async def _search_deezer_url(url: str, kind: str) -> str:
         if matched and matched.get("id"):
             return f"https://www.deezer.com/track/{matched['id']}"
 
-    title = _search_title(info)
-    if not title and source.platform in (pcfg.QOBUZ, pcfg.AMAZON):
-        title = _title_from_page_url(original_url) or metadata_bridge.search_hint_from_url(original_url)
-    if not title:
+    query = metadata_bridge._search_metadata_hint(info, kind, original_url)
+    if not query:
         return ""
-    artist = info.artist if info and info.artist != "Unknown Artist" else ""
-    query = f"{artist} {title}".strip()
     payload = await metadata_bridge._fetch_json(
         f"https://api.deezer.com/search/{kind}", params={"q": query, "limit": 5}
     )
@@ -634,18 +742,6 @@ async def _search_deezer_url(url: str, kind: str) -> str:
         item_id = item.get("id")
         if item_id:
             return f"https://www.deezer.com/{kind}/{item_id}"
-    return ""
-
-
-def _title_from_page_url(url: str) -> str:
-    from urllib.parse import unquote, urlsplit
-
-    parts = [unquote(part) for part in urlsplit(url).path.split("/") if part]
-    for marker in ("album", "track", "song", "albums", "tracks"):
-        if marker in parts:
-            index = parts.index(marker)
-            if index + 1 < len(parts):
-                return parts[index + 1].replace("-", " ").strip()
     return ""
 
 

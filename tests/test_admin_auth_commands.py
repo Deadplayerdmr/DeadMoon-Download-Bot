@@ -110,16 +110,13 @@ class AdminCommandTests(unittest.TestCase):
         os.environ.update(self.old_env)
         self.temp.cleanup()
 
-    def test_deezer_commands_have_distinct_usage_strings(self):
-        for command in ("/authenticatedeezer", "/newarl"):
-            with self.subTest(command=command):
-                self.message.reply.reset_mock()
-                self.message.text = command
-                asyncio.run(self.main.authenticate_deezer(self.message))
-                self.assertEqual(
-                    self.message.reply.await_args.args[0],
-                    f"❌ Usage: `{command} <token>`",
-                )
+    def test_deezer_command_has_authenticatedeezer_usage_string(self):
+        self.message.text = "/authenticatedeezer"
+        asyncio.run(self.main.authenticate_deezer(self.message))
+        self.assertEqual(
+            self.message.reply.await_args.args[0],
+            "❌ Usage: `/authenticatedeezer <token>`",
+        )
 
     def test_deezer_saves_and_refreshes(self):
         arl = "a" * 60

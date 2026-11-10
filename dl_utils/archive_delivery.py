@@ -754,7 +754,7 @@ def hashed_archive_basename(hash_title: str, copy_zip_name: str) -> str:
     served out of a public directory.
     """
     md5_hash = hashlib.md5(hash_title.encode()).hexdigest()[:8]
-    return re.sub(r"[^.a-zA-Z0-9()_-]", "_", f"{copy_zip_name} ({md5_hash})")
+    return re.sub(r"[^.a-zA-Z0-9()_&',-]", "_", f"{copy_zip_name} ({md5_hash})")
 
 
 # ---------------------------------------------------------------------------

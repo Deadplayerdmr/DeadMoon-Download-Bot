@@ -51,7 +51,14 @@ class _FakeEvent:
         self.answers = []
         self.messages = []
         self.reply_markups = []
+        self.deleted = False
+        self.delete_error = None
         self.from_user = _FakeUser(user_id)
+
+    async def delete(self):
+        if self.delete_error:
+            raise self.delete_error
+        self.deleted = True
 
     async def answer(self, text, parse_mode=None, reply_markup=None, **kwargs):
         self.answers.append(text)
@@ -294,8 +301,8 @@ class TestSlotAndStagingAreAlwaysReleased(StreamingCaseBase):
             platform=pcfg.QOBUZ,
             kind=st.KIND_TRACK,
             object_id="foobaz123",
-            artist="Canonical Artist",
-            title="Canonical Song",
+            artist="Engine Artist",
+            title="Engine Song",
             album_title="Canonical Album",
         )
         original_release_info = st.metadata_bridge.release_info
@@ -310,8 +317,8 @@ class TestSlotAndStagingAreAlwaysReleased(StreamingCaseBase):
             st.metadata_bridge.release_info = original_release_info
 
         metadata = self.delivered[0][1]
-        self.assertEqual(metadata["artist"], "Canonical Artist")
-        self.assertEqual(metadata["title"], "Canonical Song")
+        self.assertEqual(metadata["artist"], "Engine Artist")
+        self.assertEqual(metadata["title"], "Engine Song")
         self.assertEqual(metadata["source_label"], "Qobuz (Direct · streamrip)")
         self.assertEqual(metadata["quality_label"], "FLAC 24-bit/96 kHz")
 
@@ -410,6 +417,113 @@ class _Result:
         self.provider = "token"
         self.errors = []
         self.workdir = workdir
+
+
+class TestOriginalMessageDeletion(StreamingCaseBase):
+    async def _run_release(self):
+        async def ok(platform, url, kind, workdir, progress_cb=None):
+            return _Result(platform, url, workdir)
+
+        event = _FakeEvent()
+        with mock.patch.object(st, "download_release", side_effect=ok):
+            await st._handle_release(
+                event, st.parse_link("https://open.qobuz.com/track/foobaz123")
+            )
+        return event
+
+    async def _run_artist(self):
+        event = _FakeEvent()
+        with mock.patch.object(
+            st.metadata_bridge, "artist_album_links", new=mock.AsyncMock(return_value=({"name": "Test Artist"}, []))
+        ), mock.patch.object(
+            st, "_download_discography_in_one_go", new=mock.AsyncMock(return_value=[{"name": "Album"}])
+        ):
+            await st._handle_artist(
+                event, st.parse_link("https://open.qobuz.com/artist/12345")
+            )
+        return event
+
+    def setUp(self):
+        super().setUp()
+        self.enable_qobuz()
+        self.set_env(QOBUZ_ARTIST_DOWNLOAD_ENABLED="1", AUTO_DELETE_ENABLED="1")
+
+    async def test_release_deletes_original_message_after_delivery(self):
+        calls = []
+
+        async def delivered(event, metadata, tracks, is_album):
+            calls.append("delivered")
+            self.assertNotIn("original_deleted", calls)
+
+        async def deleted():
+            self.assertEqual(calls, ["delivered"])
+            calls.append("original_deleted")
+
+        with mock.patch.object(st, "create_and_send_zip", side_effect=delivered), mock.patch.object(
+            _FakeEvent, "delete", side_effect=deleted
+        ):
+            event = await self._run_release()
+        self.assertEqual(calls, ["delivered", "original_deleted"])
+        self.assertEqual(len(self.delivered), 0)
+        self.assertEqual(self.active_count(), 0)
+
+    async def test_artist_deletes_original_message_after_delivery(self):
+        calls = []
+
+        async def delivered(event, artist_metadata, downloaded):
+            calls.append("delivered")
+            self.assertNotIn("original_deleted", calls)
+
+        async def deleted():
+            self.assertEqual(calls, ["delivered"])
+            calls.append("original_deleted")
+
+        with mock.patch.object(st, "create_and_send_artist_zip", side_effect=delivered), mock.patch.object(
+            _FakeEvent, "delete", side_effect=deleted
+        ):
+            event = await self._run_artist()
+        self.assertEqual(calls, ["delivered", "original_deleted"])
+        self.assertEqual(self.active_count(), 0)
+
+    async def test_release_does_not_delete_original_when_auto_delete_is_disabled(self):
+        self.set_env(AUTO_DELETE_ENABLED="0")
+        event = await self._run_release()
+        self.assertFalse(event.deleted)
+        self.assertEqual(len(self.delivered), 1)
+        self.assertEqual(self.active_count(), 0)
+
+    async def test_artist_does_not_delete_original_when_auto_delete_is_disabled(self):
+        self.set_env(AUTO_DELETE_ENABLED="0")
+        event = await self._run_artist()
+        self.assertFalse(event.deleted)
+        self.assertEqual(len(self.delivered), 1)
+        self.assertEqual(self.active_count(), 0)
+
+    async def test_release_delete_permission_error_does_not_fail_delivery_or_leak_slot(self):
+        event = _FakeEvent()
+        event.delete_error = RuntimeError("message can't be deleted")
+
+        async def ok(platform, url, kind, workdir, progress_cb=None):
+            return _Result(platform, url, workdir)
+
+        with mock.patch.object(st, "download_release", side_effect=ok):
+            await st._handle_release(
+                event, st.parse_link("https://open.qobuz.com/track/foobaz123")
+            )
+        self.assertEqual(len(self.delivered), 1)
+        self.assertEqual(len(event.answers), 1, "Telegram delete error produced a failure reply")
+        self.assertNotIn("download failed", event.last_answer.lower())
+        self.assertEqual(self.active_count(), 0)
+        self.assertEqual(self.staging_root_is_clean(), [])
+
+    async def test_artist_delete_permission_error_does_not_fail_delivery_or_leak_slot(self):
+        with mock.patch.object(
+            _FakeEvent, "delete", side_effect=RuntimeError("message can't be deleted")
+        ):
+            event = await self._run_artist()
+        self.assertEqual(len(self.delivered), 1)
+        self.assertEqual(self.active_count(), 0)
+        self.assertEqual(self.staging_root_is_clean(), [])
 
 
 class TestConcurrencyContractShape(StreamingCaseBase):

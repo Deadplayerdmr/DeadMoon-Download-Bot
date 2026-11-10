@@ -21,7 +21,7 @@ def read_token_env_value(key: str) -> str:
     """Read a value straight out of token.env, ignoring the environment.
 
     docker-compose's env_file injects variables at container *creation* time,
-    so the environment can hold a stale value after /newarl rewrites the file.
+    so the environment can hold a stale value after /authenticatedeezer rewrites the file.
     The file is the source of truth whenever it exists.
     """
     try:

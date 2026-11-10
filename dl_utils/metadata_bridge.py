@@ -1,10 +1,10 @@
-"""Public, credential-free metadata resolution across platforms.
+"""Best-effort public and configured-provider metadata resolution.
 
 The download engines know how to get bytes; they are not a reliable source for
 *what* those bytes are. A CLI tool writes whatever folder template it likes,
-and its track list does not always match the platform the user linked. So the canonical
-release description (title, artist, album, year, cover, tracklist, ISRCs) is
-resolved here first, from endpoints that need no account:
+and its track list does not always match the platform the user linked. Release
+metadata is resolved here first from public endpoints and configured provider
+APIs:
 
 * **iTunes Lookup** (`https://itunes.apple.com/lookup`) — Apple Music albums,
   songs and artists, with full tracklists and artwork URLs. No auth.
@@ -12,6 +12,8 @@ resolved here first, from endpoints that need no account:
   `search/isrc:<isrc>` cross-matching. No auth.
 * **Spotify oEmbed** (`https://open.spotify.com/oembed`) — title and artwork
   for a track/album/plural link. No auth.
+* **Qobuz catalogue API** — album/track metadata, using configured app and user
+  authentication when available.
 * **Odesli / song.link** (`https://api.song.link/v1-alpha.1/links`) — the
   bridge: given a link on any one platform it returns the matching links on
   every other platform that carries the same recording or release. That is how
@@ -273,12 +275,63 @@ async def fetch_bytes(url: str) -> bytes | None:
 
 _ITUNES_SEARCH = "https://itunes.apple.com/search"
 _QOBUZ_API = "https://play.qobuz.com/api.json/0.2"
+_GENERIC_METADATA_NAMES = frozenset({
+    "qobuz", "play qobuz", "open qobuz", "tidal", "spotify",
+    "apple music", "itunes", "deezer", "soundcloud", "amazon music",
+    "amazon", "youtube", "youtube music", "music", "home", "login",
+    "sign in", "log in", "web player", "music streaming",
+})
+
+
+def _clean_metadata_text(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("title") or ""
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n-|–—")
+    return "" if text.casefold() in _GENERIC_METADATA_NAMES else text
+
+
+def _real_release_metadata(info: ReleaseInfo | None) -> bool:
+    if not info:
+        return False
+    artist = _clean_metadata_text(info.artist)
+    if artist.casefold() == "unknown artist":
+        artist = ""
+    title = _clean_metadata_text(
+        info.title if info.kind == KIND_TRACK else info.album_title
+    )
+    if title.casefold() == "unknown album":
+        title = ""
+    return bool(artist or title)
+
+
+def _search_metadata_hint(info: ReleaseInfo | None, kind: str, url: str) -> str:
+    """Build a search only from human metadata or a descriptive store slug."""
+    if _real_release_metadata(info):
+        parts = [
+            _clean_metadata_text(info.artist),
+            _clean_metadata_text(info.title if kind == KIND_TRACK else info.album_title),
+        ]
+        return " ".join(part for part in parts if part and part.casefold() != "unknown artist").strip()
+
+    slug = search_hint_from_url(url)
+    words = re.findall(r"[^\W\d_]+", slug.casefold())
+    if len(words) < 2 or any(word in _GENERIC_METADATA_WORDS for word in words):
+        return ""
+    return slug
+
+
+def _canonical_request_link(
+    platform: str, kind: str, object_id: str, url: str = ""
+) -> str:
+    if platform == PLATFORM_QOBUZ and kind in (KIND_ALBUM, KIND_TRACK) and object_id:
+        return f"https://open.qobuz.com/{kind}/{object_id}"
+    return url
 
 
 def search_hint_from_url(url: str) -> str:
     """Extract human-readable Qobuz slug words for public catalogue searches."""
     match = re.search(r"/(?:album|track)/([^/]+)/[A-Za-z0-9]+(?:[/?#]|$)", url, re.I)
-    if not match:
+    if not match or match.group(1) == "-":
         return ""
     from urllib.parse import unquote
 
@@ -286,22 +339,39 @@ def search_hint_from_url(url: str) -> str:
 
 
 async def qobuz_public(kind: str, object_id: str) -> ReleaseInfo | None:
-    """Read Qobuz's public catalogue API when web pages block scraping."""
+    """Read Qobuz catalogue metadata, authenticating when configured."""
     endpoint = "album/get" if kind == KIND_ALBUM else "track/get"
+    fields = pcfg.qobuz_fields()
+    app_id = str(fields.get("app_id") or "").strip()
+    use_auth_token = fields.get("use_auth_token")
+    auth_token = str(fields.get("password_or_token") or "").strip() if use_auth_token else ""
+    params = {f"{kind}_id": object_id}
+    headers = {}
+    if app_id:
+        params["app_id"] = app_id
+        headers["X-App-Id"] = app_id
+    if auth_token:
+        headers["X-User-Auth-Token"] = auth_token
     payload = await _fetch_json(
-        f"{_QOBUZ_API}/{endpoint}", params={f"{kind}_id": object_id}
+        f"{_QOBUZ_API}/{endpoint}", params=params,
+        **({"headers": headers} if headers else {}),
     )
     if not isinstance(payload, dict) or payload.get("error"):
         return None
     if isinstance(payload.get(kind), dict):
         payload = payload[kind]
-    if not payload.get("title"):
+    title = _clean_metadata_text(payload.get("title"))
+    if not title:
         return None
 
     album = payload.get("album") or {}
     artist_data = payload.get("artist") or album.get("artist") or {}
-    artist = artist_data.get("name") or artist_data.get("display") or ""
-    album_title = album.get("title") or (payload.get("title", "") if kind == KIND_ALBUM else "")
+    artist = _clean_metadata_text(
+        artist_data.get("name") or artist_data.get("display") or ""
+    )
+    album_title = _clean_metadata_text(
+        album.get("title") or (title if kind == KIND_ALBUM else "")
+    )
     date = (
         payload.get("release_date_original")
         or album.get("release_date_original")
@@ -325,7 +395,7 @@ async def qobuz_public(kind: str, object_id: str) -> ReleaseInfo | None:
         for index, item in enumerate(raw_tracks, start=1)
         if isinstance(item, dict)
     ]
-    title = payload.get("title") or album_title
+    title = title or album_title
     link = f"https://open.qobuz.com/{kind}/{object_id}"
     return ReleaseInfo(
         platform=PLATFORM_QOBUZ,
@@ -421,7 +491,7 @@ async def deezer_search(term: str, kind: str) -> ReleaseInfo | None:
 
 
 async def _cross_match_public(info: ReleaseInfo, term: str, kind: str, storefront=None) -> ReleaseInfo:
-    """Add public sibling links and fill incomplete page-title metadata."""
+    """Add sibling links without replacing verified direct-provider metadata."""
     for candidate in (
         await itunes_search(term, kind, storefront),
         await deezer_search(term, kind),
@@ -432,31 +502,35 @@ async def _cross_match_public(info: ReleaseInfo, term: str, kind: str, storefron
         info.siblings[key] = candidate.track_link if kind == KIND_TRACK else candidate.album_link
         if key == "apple":
             info.siblings["itunes"] = info.siblings[key]
-        if info.artist in ("", "Unknown Artist") or not (info.title or info.album_title):
-            return candidate
     return info
 
 
 async def public_search_metadata(
     platform: str, kind: str, object_id: str, url: str, storefront=None
 ) -> ReleaseInfo | None:
-    """Resolve Qobuz/Amazon metadata without relying on api.song.link."""
+    """Resolve store metadata without turning boilerplate into a search query."""
     info = (
         await qobuz_public(kind, object_id) if platform == PLATFORM_QOBUZ else None
     )
     if info is None:
         info = await page_metadata(url, platform, kind, object_id)
-    term = " ".join(
-        part for part in (
-            info.artist if info and info.artist != "Unknown Artist" else "",
-            info.title if kind == KIND_TRACK else info.album_title if info else "",
-        ) if part
-    ).strip() or search_hint_from_url(url)
+    term = _search_metadata_hint(info, kind, url)
     if not term:
         return info
-    return await _cross_match_public(info, term, kind, storefront) if info else await itunes_search(term, kind, storefront) or await deezer_search(term, kind)
+    if info is not None:
+        return await _cross_match_public(info, term, kind, storefront)
 
-    return None
+    candidate = await itunes_search(term, kind, storefront) or await deezer_search(term, kind)
+    if candidate is None:
+        return None
+    if platform == PLATFORM_QOBUZ:
+        # A cross-store guess is enrichment, not proof of the Qobuz release's
+        # identity. Keep the requested platform and canonical link intact.
+        candidate.platform = platform
+        candidate.object_id = object_id
+        candidate.album_link = _canonical_request_link(platform, KIND_ALBUM, object_id, url)
+        candidate.track_link = _canonical_request_link(platform, KIND_TRACK, object_id, url)
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -951,9 +1025,9 @@ async def page_metadata(url: str, platform: str, kind: str, object_id: str) -> R
                 continue
             artist_data = item.get("byArtist") or item.get("brand") or {}
             if isinstance(artist_data, dict):
-                structured_artist = structured_artist or artist_data.get("name", "")
+                structured_artist = structured_artist or _clean_metadata_text(artist_data.get("name"))
             if kind == KIND_ALBUM and item.get("@type") in ("MusicAlbum", "Product"):
-                structured_title = structured_title or item.get("name", "")
+                structured_title = structured_title or _clean_metadata_text(item.get("name"))
             structured_date = structured_date or item.get("datePublished") or item.get("releaseDate") or ""
             images = item.get("image") or []
             if isinstance(images, str):
@@ -967,8 +1041,14 @@ async def page_metadata(url: str, platform: str, kind: str, object_id: str) -> R
         if match:
             from html import unescape
             title = unescape(match.group(1)).strip()
-    title = re.sub(r"\s+(?:-|–|—|\|)\s*(?:Qobuz|TIDAL|Amazon Music).*$", "", title, flags=re.I)
+    title = re.sub(
+        r"\s+(?:-|–|—|\|)\s*(?:Qobuz|Play Qobuz|Open Qobuz|TIDAL|Spotify|Apple Music|Deezer|SoundCloud|Amazon Music).*$",
+        "", title, flags=re.I,
+    )
+    title = _clean_metadata_text(title)
     artist, release_title = "", title
+    if not release_title:
+        release_title = structured_title
     if platform == PLATFORM_AMAZON:
         # Amazon commonly formats title as "Album by Artist" and places
         # "Artist - Title" in the Open Graph description.
@@ -985,10 +1065,11 @@ async def page_metadata(url: str, platform: str, kind: str, object_id: str) -> R
         artist, release_title = (part.strip() for part in title.split(" - ", 1))
     if platform == PLATFORM_TIDAL:
         artist, release_title = release_title, artist
-    artist = artist or structured_artist
-    release_title = release_title or structured_title
+    artist = _clean_metadata_text(artist or structured_artist)
+    release_title = _clean_metadata_text(release_title or structured_title)
     if not release_title:
         return None
+    canonical = _canonical_request_link(platform, kind, object_id, url)
     return ReleaseInfo(
         platform=platform,
         kind=kind,
@@ -999,6 +1080,8 @@ async def page_metadata(url: str, platform: str, kind: str, object_id: str) -> R
         year=_year_from(structured_date),
         release_date=structured_date[:10],
         cover_url=upgrade_cover_url(_meta_content(text, "og:image") or structured_cover),
+        album_link=canonical if kind == KIND_ALBUM else "",
+        track_link=canonical if kind == KIND_TRACK else "",
         source="page-title",
     )
 
@@ -1044,7 +1127,14 @@ async def release_info(
     elif platform == PLATFORM_SPOTIFY and url:
         info = await _from_spotify_oembed(url, kind, object_id)
     elif platform in (PLATFORM_QOBUZ, PLATFORM_TIDAL) and url:
-        info = await _from_odesli(url, kind, object_id, platform)
+        if platform == PLATFORM_QOBUZ:
+            info = await qobuz_public(kind, object_id)
+        odesli = await _from_odesli(url, kind, object_id, platform)
+        if info is not None and odesli is not None:
+            for sibling_platform, sibling_url in (odesli.siblings or {}).items():
+                info.siblings.setdefault(sibling_platform, sibling_url)
+        else:
+            info = odesli
         if info is None and platform == PLATFORM_TIDAL:
             info = await tidal_api_metadata(kind, object_id)
         if info is None:
@@ -1098,17 +1188,22 @@ async def _from_odesli(url: str, kind: str, object_id: str, platform: str) -> Re
     data = await odesli_links(url)
     if not data:
         return None
+    title = _clean_metadata_text(data["title"])
+    artist = _clean_metadata_text(data["artist"])
+    if not title and not artist:
+        return None
     is_track = kind == KIND_TRACK
+    canonical = _canonical_request_link(platform, kind, object_id, url)
     return ReleaseInfo(
         platform=platform,
         kind=kind,
         object_id=object_id,
-        title=data["title"] if is_track else "",
-        artist=data["artist"] or "Unknown Artist",
-        album_title="" if is_track else data["title"],
+        title=title if is_track else "",
+        artist=artist or "Unknown Artist",
+        album_title="" if is_track else title,
         cover_url=data.get("artwork", ""),
-        track_link=url if is_track else "",
-        album_link="" if is_track else url,
+        track_link=canonical if is_track else "",
+        album_link="" if is_track else canonical,
         isrcs=[data["isrc"]] if data.get("isrc") else [],
         source="odesli",
         siblings=data.get("platforms", {}),
@@ -1189,17 +1284,11 @@ async def artist_album_links(platform: str, object_id: str, storefront: str | No
 
 
 def merge_info(engine_metadata, bridge_info: ReleaseInfo | None) -> dict:
-    """Combine bridge metadata with whatever the engine inferred from the tree.
+    """Combine public enrichment with metadata read from downloaded audio.
 
-    `engine_metadata` is a `provider_engines.ReleaseMetadata` (or None). The
-    bridge wins for the fields a public API reports reliably — artist, album,
-    year, release date, cover, links — because an engine's folder name is a
-    template artefact, not a source of truth. Everything else falls back to the
-    engine, so a metadata outage never costs the user audio that already
-    downloaded.
-
-    Returns the dict shape `archive_delivery.build_release_entries` and the
-    caption builders expect.
+    Direct-engine tags and paths are authoritative when a cross-store search is
+    unverified or the bridge describes a different release. Provider APIs still
+    enrich matching downloads with dates, artwork, links, and track details.
     """
     from dl_utils.deezer_utils import clean_filename
 
@@ -1243,21 +1332,99 @@ def merge_info(engine_metadata, bridge_info: ReleaseInfo | None) -> dict:
         track_artists.append(
             track.get("artist_name") or track.get("ART_NAME") or artist_data
         )
+
+    def real_text(value, unknown=""):
+        text = _clean_metadata_text(value)
+        return "" if text.casefold() == unknown else text
+
+    def normalized_words(value):
+        ignored = {"album", "single", "ep", "version", "remaster", "remastered", "deluxe"}
+        return {
+            word for word in re.findall(r"[^\W_]+", str(value or "").casefold())
+            if word not in ignored
+        }
+
+    def conflicts(engine_value, bridge_value):
+        left, right = normalized_words(engine_value), normalized_words(bridge_value)
+        return bool(left and right and not (left & right))
+
+    engine_artist = real_text(engine and engine.artist, "unknown artist")
+    engine_album = real_text(engine and engine.album_title, "unknown album")
+    bridge_artist = real_text(bridge_info and bridge_info.artist, "unknown artist")
+    bridge_album = real_text(bridge_info and bridge_info.album_title, "unknown album")
+    direct_labels = ("streamrip", "dotify-cli", "gamdl", "amazon-cli")
+    engine_verified = bool(
+        engine_artist and engine_album
+        and any(label in str(getattr(engine, "source_label", "")).casefold() for label in direct_labels)
+    )
+    unverified_search = bool(
+        bridge_info and bridge_info.source in ("itunes-search", "deezer-search")
+    )
+    wild_conflict = bool(
+        engine_verified and bridge_info and (
+            conflicts(engine_album, bridge_album)
+            or (engine_artist and bridge_artist and conflicts(engine_artist, bridge_artist))
+        )
+    )
+    engine_wins = engine_verified and (unverified_search or wild_conflict)
+    if not _real_release_metadata(bridge_info):
+        engine_wins = engine_verified
+
     artist = artist_value(
-        bridge_info and bridge_info.artist,
-        engine and engine.artist,
+        engine_artist if engine_wins else bridge_artist,
+        bridge_artist if engine_wins else engine_artist,
         *track_artists,
     )
     album_title = pick(
-        bridge_info and bridge_info.album_title,
-        engine and engine.album_title,
+        engine_album if engine_wins else bridge_album,
+        bridge_album if engine_wins else engine_album,
         "Unknown Album",
     )
-    year = pick(bridge_info and bridge_info.year, engine and engine.year, "")
-    release_date = pick(bridge_info and bridge_info.release_date, engine and engine.release_date, "")
+    year = pick(
+        engine and engine.year if engine_wins else bridge_info and bridge_info.year,
+        bridge_info and bridge_info.year if engine_wins else engine and engine.year,
+        "",
+    )
+    release_date = pick(
+        engine and engine.release_date if engine_wins else bridge_info and bridge_info.release_date,
+        bridge_info and bridge_info.release_date if engine_wins else engine and engine.release_date,
+        "",
+    )
     cover = best_cover(bridge_info and bridge_info.cover_data, engine and engine.cover_data)
+    qobuz_request = any(
+        getattr(source, "platform", None) == PLATFORM_QOBUZ
+        for source in (engine, bridge_info) if source
+    ) or any(
+        "qobuz" in str(getattr(source, "source_label", "")).casefold()
+        for source in (engine,) if source
+    )
     album_link = pick(bridge_info and bridge_info.album_link, engine and engine.album_link, "")
     track_link = pick(bridge_info and bridge_info.track_link, engine and engine.track_link, "")
+    if qobuz_request:
+        object_id = next(
+            (
+                str(getattr(source, "object_id", "") or "") for source in (bridge_info, engine)
+                if source and getattr(source, "object_id", "")
+            ),
+            "",
+        )
+        if not object_id:
+            candidate = pick(engine and engine.album_link, engine and engine.track_link, "")
+            object_id = str(candidate or "").rstrip("/").rsplit("/", 1)[-1]
+        kind = (
+            KIND_TRACK if (bridge_info and bridge_info.kind == KIND_TRACK)
+            or (engine and getattr(engine, "kind", None) == KIND_TRACK) else KIND_ALBUM
+        )
+        canonical = _canonical_request_link(PLATFORM_QOBUZ, kind, object_id)
+        if kind == KIND_ALBUM:
+            album_link = canonical
+        else:
+            track_link = canonical
+        if bridge_info and kind == KIND_TRACK and not bridge_info.album_link:
+            album_link = ""
+    elif engine_wins:
+        album_link = pick(engine and engine.album_link, album_link, "")
+        track_link = pick(engine and engine.track_link, track_link, "")
 
     is_track = bool(
         (bridge_info and bridge_info.kind == KIND_TRACK)
@@ -1266,8 +1433,8 @@ def merge_info(engine_metadata, bridge_info: ReleaseInfo | None) -> dict:
     # For a single track, `title` is the song and `album_title` the parent
     # release; for an album both are the release name.
     title = pick(
-        bridge_info and is_track and bridge_info.title,
-        engine and is_track and engine.title,
+        engine and is_track and engine.title if engine_wins else bridge_info and is_track and _clean_metadata_text(bridge_info.title),
+        bridge_info and is_track and _clean_metadata_text(bridge_info.title) if engine_wins else engine and is_track and engine.title,
         album_title,
     )
 

@@ -94,7 +94,7 @@ def init_deezer_session(proxy_server: str, quality: str) -> None:
 
     # Prefer token.env over the environment: compose injects env_file only at
     # container creation, so the environment still holds the old token after
-    # /newarl rewrites the file. Imported here to keep the module importable
+    # /authenticatedeezer rewrites the file. Imported here to keep the module importable
     # standalone.
     from utils import read_token_env_value
 

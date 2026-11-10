@@ -152,8 +152,6 @@ async def set_admin_commands(bot_instance):
         BotCommand(command="allow", description="Whitelist IDs: /allow <ID1> <ID2> or /allow <ID1>,<ID2>"),
         BotCommand(command="block", description="Block IDs: /block <ID1> <ID2> or /block <ID1>,<ID2>"),
         BotCommand(command="blockall", description="Remove ALL whitelisted IDs (except admin)"),
-        BotCommand(command="newarl", description="Replace Deezer ARL token: /newarl <arl>"),
-        BotCommand(command="arl", description="Show current Deezer ARL token"),
         BotCommand(command="authenticatedeezer", description="Set Deezer ARL and reload the session"),
         BotCommand(command="authenticatetidal", description="Link Tidal TV device or paste OAuth credentials"),
         BotCommand(command="cancelauth", description="Cancel pending Tidal device authorization"),
@@ -504,53 +502,24 @@ def set_deezer_token(new_token: str) -> bool:
         utils.TOKEN_ENV_PATH = previous
 
 
-@dp.message(Command("arl"), F.from_user.id == ADMIN_ID)
-async def show_arl(message: Message):
-    """Display the current DEEZER_TOKEN (ARL) to the admin."""
-    token = get_deezer_token()
-    
-    if not token:
-        await message.reply("⚠️ No DEEZER_TOKEN found in token.env")
-        return
-    
-    # Mask the token for security (show first 10 and last 10 chars)
-    if len(token) > 20:
-        masked = f"{token[:10]}...{token[-10:]}"
-    else:
-        masked = token
-    
-    response = f"**Current ARL Token:**\n`{masked}`"
-    await message.reply(response, parse_mode="Markdown")
-
-
-@dp.message(Command("newarl"), F.from_user.id == ADMIN_ID)
-async def update_arl(message: Message):
-    """Update the DEEZER_TOKEN and restart the bot."""
-    
-    # Extract token from command
+@dp.message(Command("authenticatedeezer"), F.from_user.id == ADMIN_ID)
+async def authenticate_deezer(message: Message):
+    """Update DEEZER_TOKEN and reload the Deezer session in-process."""
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        command = parts[0].split("@", 1)[0].casefold() if parts else "/newarl"
-        usage = "/authenticatedeezer" if command == "/authenticatedeezer" else "/newarl"
-        await message.reply(f"❌ Usage: `{usage} <token>`", parse_mode="Markdown")
+        await message.reply("❌ Usage: `/authenticatedeezer <token>`", parse_mode="Markdown")
         return
-    
+
     new_token = parts[1].strip()
-    
-    # Validate token (should be a long hex string)
     if len(new_token) < 50:
         await message.reply("⚠️ Token seems too short. ARL tokens are typically 192+ characters.")
         return
-    
-    # Update the token file
+
     if update_token_env_keys({"DEEZER_TOKEN": new_token, "DEEZER_ENABLED": "1"}):
-        # Rebuild the session here instead of exiting the process. sys.exit()
-        # inside an async handler is unreliable, and a container restart reuses
-        # the creation-time environment, so the new token could be lost.
         try:
-            await refresh_deezer_session("admin /newarl token update")
+            await refresh_deezer_session("admin /authenticatedeezer token update")
         except Exception as e:
-            logging.error(f"Session re-init after /newarl failed: {e}")
+            logging.error(f"Session re-init after /authenticatedeezer failed: {e}")
             await message.reply(
                 "⚠️ <b>ARL token saved, but the session could not be reloaded.</b>\n\n"
                 f"<code>{html.escape(str(e))}</code>\n"
@@ -567,11 +536,6 @@ async def update_arl(message: Message):
         logging.info("Admin updated the ARL token; session reloaded in-process.")
     else:
         await message.reply("❌ Failed to update token.env file")
-
-
-@dp.message(Command("authenticatedeezer"), F.from_user.id == ADMIN_ID)
-async def authenticate_deezer(message: Message):
-    await update_arl(message)
 
 
 _TIDAL_AUTH_TASKS: Dict[int, asyncio.Task] = {}

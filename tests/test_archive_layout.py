@@ -510,8 +510,11 @@ class TestDeezerReExports(unittest.TestCase):
 
     def test_artist_toggle_default_matches_config(self):
         """Every platform, including Deezer, requires an explicit artist opt-in."""
-        for platform in pcfg.PLATFORMS:
-            self.assertFalse(pcfg.artist_download_enabled(platform), platform)
+        from unittest import mock
+
+        with mock.patch.object(pcfg, "get_bool_env", return_value=False):
+            for platform in pcfg.PLATFORMS:
+                self.assertFalse(pcfg.artist_download_enabled(platform), platform)
 
 
 if __name__ == "__main__":

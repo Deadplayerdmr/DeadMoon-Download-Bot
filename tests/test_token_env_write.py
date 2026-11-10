@@ -1,4 +1,4 @@
-"""Offline checks for the /newarl write path in main.set_deezer_token.
+"""Offline checks for the /authenticatedeezer write path in main.set_deezer_token.
 
 This is the only place the bot rewrites a credentials file at runtime, so it
 carries two contracts that are easy to break quietly:

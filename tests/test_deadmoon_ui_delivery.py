@@ -33,7 +33,7 @@ class PublicBoardTests(unittest.TestCase):
     def test_board_has_no_engine_credentials_or_admin_statistics(self):
         with mock.patch.object(
             pcfg, "platform_enabled", side_effect=lambda platform: platform != pcfg.QOBUZ
-        ):
+        ), mock.patch.object(pcfg, "artist_download_enabled", return_value=False):
             board = streaming.public_platforms_board("test_bot")
         for platform in pcfg.PLATFORMS:
             self.assertIn(pcfg.PLATFORM_LABELS[platform], board)

@@ -14,9 +14,9 @@ services:
       - /var/www/html/deadmoonradio.com/public_html/download:/files
       # Persist whitelist.json outside the container
       - ./data:/usr/src/app/data
-      # The /arl and /newarl commands read and rewrite this file directly, so it
-      # has to exist in the container. env_file alone only injects variables at
-      # creation time and never creates the file, which made both commands fail.
+      # /authenticatedeezer reads and rewrites this file directly, so it has to
+      # exist in the container. env_file alone only injects variables at creation
+      # time and never creates the file, which made runtime authentication fail.
       - ./token.env:/usr/src/app/token.env
     restart: always
     dns: [1.1.1.1, 8.8.8.8]

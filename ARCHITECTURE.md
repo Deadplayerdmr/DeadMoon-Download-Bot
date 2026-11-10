@@ -57,7 +57,7 @@ dl_utils/
 arl_fetcher/                optional bun/TypeScript helper that logs in and prints an ARL
 local_resources/            operator credential/cookie files + sanitized templates
 langs.json                  string → locale → text; __() indexes it
-tests/                      413 offline tests; no network, no Telegram, no credentials
+tests/                      477 offline tests; no network, no Telegram, no credentials
 ```
 
 Boundary rules that matter:
@@ -145,8 +145,8 @@ get_int_env(key, default) / get_float_env(key, default)
 
 `get_env_or_token_file` prefers the **file** over the process environment. That is
 deliberate: `env_file:` in compose injects values only at container creation, so without
-this, rotating a token would require recreating the container. `/newarl` rewrites
-`token.env` in place and the next request sees the new ARL.
+this, rotating a token would require recreating the container. `/authenticatedeezer`
+rewrites `token.env` in place and the next request sees the new ARL.
 
 Consequences to respect:
 
@@ -469,7 +469,7 @@ wrong and hard to notice.
 
 ## 10. Testing conventions
 
-`python3 -m unittest discover tests` — 392 tests, no network, no Telegram, no credentials.
+`python3 -m unittest discover tests` — 477 tests, no network, no Telegram, no credentials.
 
 - `tests/test_platform_config.py` repoints `utils.TOKEN_ENV_PATH` at a nonexistent file so
   the environment is the only config source. Follow this; never assert against a real

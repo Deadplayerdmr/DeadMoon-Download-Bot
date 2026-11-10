@@ -208,6 +208,21 @@ async def _reply_error(event, platform: str, error: Exception, kind: str = "trac
     await event.answer(_failure_text(platform, kind, url, error))
 
 
+async def _delete_original_message(event: types.Message, user_id: int, username: str, first_name: str) -> None:
+    if not pcfg.auto_delete_enabled():
+        return
+    try:
+        await event.delete()
+    except Exception as delete_error:
+        print(f"Could not delete original message: {delete_error}")
+        return
+    print(
+        f"USER_DEBUG: Deleted original message from user_id={user_id} "
+        f"username={username} first_name={first_name}"
+    )
+    print(f"Deleted original message from user {user_id}")
+
+
 def _effective_kind(link: ResolvedLink) -> str:
     """KIND_TRACK when the link means a single track, else its own kind."""
     if link.kind == KIND_ARTIST:
@@ -308,6 +323,7 @@ async def _handle_release(event: types.Message, link: ResolvedLink) -> None:
         await _safe_delete(tmp_msg)
         tmp_msg = None
         await create_and_send_zip(event, metadata, result.tracks, is_album=kind == KIND_ALBUM)
+        await _delete_original_message(event, user_id, username, first_name)
         print(
             f"[streaming] {platform} {kind} {link.object_id}: "
             f"{result.track_count} track(s) delivered via {result.provider}"
@@ -411,6 +427,7 @@ async def _handle_artist(event: types.Message, link: ResolvedLink) -> None:
         await _safe_delete(tmp_msg)
         tmp_msg = None
         await create_and_send_artist_zip(event, artist_metadata, downloaded)
+        await _delete_original_message(event, user_id, username, first_name)
         print(
             f"[streaming] {platform} artist {link.object_id}: "
             f"{len(downloaded)} release(s) delivered"

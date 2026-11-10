@@ -109,6 +109,23 @@ if SOUNDCLOUD_OAUTH_TOKEN:
 else:
     print("No SoundCloud OAuth token - using default quality")
 
+
+async def _delete_original_message(event: types.Message) -> None:
+    if not pcfg.auto_delete_enabled():
+        return
+    try:
+        await event.delete()
+    except Exception as delete_error:
+        print(f"Could not delete original message: {delete_error}")
+        return
+    user_id, username, first_name = get_user_infos(event)
+    print(
+        f"USER_DEBUG: Deleted original message from user_id={user_id} "
+        f"username={username} first_name={first_name}"
+    )
+    print(f"Deleted original message from user {user_id}")
+
+
 # Define separate temp directories
 YT_TMP_DIR = Path(TMP_DIR, "yt")
 SC_TMP_DIR = Path(TMP_DIR, "sc")
@@ -312,9 +329,6 @@ async def get_youtube_audio(event: types.Message):
                 except Exception as img_err:
                     print(f"Error downloading/processing thumbnail: {img_err}")
 
-            # Delete user message
-            await event.delete()
-
             location = request_dir / f"{track_id}.mp3"
 
             # Check if file exists
@@ -412,6 +426,8 @@ async def get_youtube_audio(event: types.Message):
                 # Schedule auto-deletion of audio message
                 await schedule_message_deletion(audio_message, AUTO_DELETE_SECONDS)
             
+            await _delete_original_message(event)
+
             # Clean up temp file
             try:
                 os.remove(location)
@@ -519,9 +535,6 @@ async def get_soundcloud_audio(event: types.Message):
                         f"Error downloading/processing SoundCloud thumbnail: {img_err}"
                     )
 
-            # Delete user message
-            await event.delete()
-
             location = request_dir / f"{track_id}.mp3"
 
             # Check if file exists
@@ -610,6 +623,8 @@ async def get_soundcloud_audio(event: types.Message):
                 # Schedule auto-deletion of audio message
                 await schedule_message_deletion(audio_message, AUTO_DELETE_SECONDS)
             
+            await _delete_original_message(event)
+
             # Clean up temp file
             try:
                 os.remove(location)
